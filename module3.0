@@ -1,0 +1,417 @@
+/*==============================================================================
+M3. AUTHOR HISTORY / CAREER / PRIOR COLLABORATION
+==============================================================================
+
+PROJECT
+-------
+Generative AI, scientific collaboration, and scientific knowledge retention.
+
+INPUT
+-----
+Primary:
+    redo.ai_paper_authors
+
+OpenAlex:
+    subugoe-collaborative.openalex_walden.works
+
+OUTPUT
+------
+    redo.ai_openalex_author_career
+    redo.ai_openalex_author_year
+    redo.ai_focal_author_years
+    redo.ai_openalex_prior_productivity
+    redo.ai_openalex_prior_productivity_binned
+
+    redo.ai_author_paper_stage
+    redo.ai_author_rolling_history_stage
+
+    redo.ai_baseline_author_profile
+    redo.ai_baseline_author_profile_final
+    redo.ai_baseline_team_categories
+    redo.ai_baseline_team_mode
+
+    redo.ai_author_history
+    redo.ai_author_history_core
+
+==============================================================================
+
+GRAIN
+-----
+Final M3:
+    one row per paper x distinct resolved OpenAlex author.
+
+==============================================================================
+
+AI TIMING
+---------
+All AI-period timing uses accepted_date from redo.aiscore as carried through M1.
+
+BASELINE:
+    2010 Q1 - 2022 Q3
+    accepted_date <= 2022-09-30
+
+TRANSITION:
+    2022 Q4 - 2023 Q2
+    2022-10-01 through 2023-06-30
+
+POST:
+    2023 Q3 onward
+    accepted_date >= 2023-07-01
+
+==============================================================================
+
+CAREER STAGE
+------------
+OpenAlex-wide first article/review publication year.
+
+Career-stage bins:
+
+    0-5
+    6-10
+    11-19
+    20-29
+    30+
+
+The exact approximate_career_age is retained for QC and sensitivity analyses.
+
+==============================================================================
+
+OPENALEX-WIDE PRIOR PRODUCTIVITY
+--------------------------------
+For a focal paper accepted in calendar year Y:
+
+    prior OpenAlex article/review publications =
+        publication_year < Y
+
+Same-calendar-year OpenAlex publications are excluded because OpenAlex does
+not provide a directly comparable historical acceptance date for the full
+OpenAlex corpus.
+
+Both are retained:
+
+    1. raw prior publication count
+    2. binned prior publication count
+
+Bins:
+
+    0-4
+    5-9
+    10-24
+    25-49
+    50-99
+    100+
+
+==============================================================================
+
+STUDY-CORPUS PRIOR HISTORY
+---------------------------
+For a focal paper accepted on date T:
+
+    prior = accepted_date < T
+
+Same-day papers are therefore excluded.
+
+These rolling collaboration variables are based on the 2010-2025 study corpus.
+
+==============================================================================
+
+AUTHORSHIP RESOLUTION
+---------------------
+The corrected M2 has:
+
+    one row per paper x distinct resolved author.
+
+M2's complete_authorship variable means:
+
+    distinct resolved authors = OpenAlex authors_count.
+
+In M3 this is explicitly renamed:
+
+    all_authors_resolved
+
+No reliance is placed on OpenAlex's authorships_truncated field because it is
+NULL throughout this snapshot.
+
+==============================================================================
+
+IMPORTANT
+---------
+Current OpenAlex cited_by_count is NOT used as prior author impact.
+
+==============================================================================*/
+
+
+/*==============================================================================
+SECTION 1. OPENALEX AUTHOR CAREER START
+==============================================================================
+
+Purpose:
+    establish OpenAlex-wide career start for every author appearing in M2.
+
+Career start is based on the earliest OpenAlex-indexed article or review.
+
+==============================================================================*/
+
+CREATE OR REPLACE TABLE `redo.ai_openalex_author_career`
+AS
+
+SELECT
+
+    REPLACE(
+        au.author.id,
+        'https://openalex.org/',
+        ''
+    ) AS author_id,
+
+    MIN(
+        w.publication_year
+    ) AS openalex_first_article_review_year,
+
+    MIN(
+        SAFE_CAST(
+            w.publication_date AS DATE
+        )
+    ) AS openalex_first_article_review_date,
+
+    COUNT(
+        DISTINCT w.id
+    ) AS openalex_total_article_review_count
+
+FROM `subugoe-collaborative.openalex_walden.works` AS w
+
+CROSS JOIN UNNEST(
+    w.authorships
+) AS au
+
+INNER JOIN (
+
+    SELECT DISTINCT
+        author_id
+    FROM `redo.ai_paper_authors`
+    WHERE author_id IS NOT NULL
+
+) AS study_authors
+
+    ON REPLACE(
+        au.author.id,
+        'https://openalex.org/',
+        ''
+    ) = study_authors.author_id
+
+WHERE
+
+    au.author.id IS NOT NULL
+
+    AND LOWER(w.type) IN (
+        'article',
+        'review'
+    )
+
+    AND w.publication_year IS NOT NULL
+
+    AND w.publication_year BETWEEN 1900 AND 2025
+
+    AND w.is_retracted IS NOT TRUE
+
+    AND w.is_paratext IS NOT TRUE
+
+GROUP BY
+    author_id;
+
+
+/*==============================================================================
+SECTION 2. OPENALEX AUTHOR-YEAR PUBLICATION COUNTS
+==============================================================================
+
+Grain:
+    one author x one OpenAlex publication year.
+
+COUNT(DISTINCT w.id) prevents any duplicated authorship appearances from
+inflating an author's publication count.
+==============================================================================*/
+
+CREATE OR REPLACE TABLE `redo.ai_openalex_author_year`
+AS
+
+SELECT
+
+    REPLACE(
+        au.author.id,
+        'https://openalex.org/',
+        ''
+    ) AS author_id,
+
+    w.publication_year,
+
+    COUNT(
+        DISTINCT w.id
+    ) AS article_review_papers
+
+FROM `subugoe-collaborative.openalex_walden.works` AS w
+
+CROSS JOIN UNNEST(
+    w.authorships
+) AS au
+
+INNER JOIN (
+
+    SELECT DISTINCT
+        author_id
+    FROM `redo.ai_paper_authors`
+    WHERE author_id IS NOT NULL
+
+) AS study_authors
+
+    ON REPLACE(
+        au.author.id,
+        'https://openalex.org/',
+        ''
+    ) = study_authors.author_id
+
+WHERE
+
+    au.author.id IS NOT NULL
+
+    AND LOWER(w.type) IN (
+        'article',
+        'review'
+    )
+
+    AND w.publication_year IS NOT NULL
+
+    AND w.publication_year BETWEEN 1900 AND 2025
+
+    AND w.is_retracted IS NOT TRUE
+
+    AND w.is_paratext IS NOT TRUE
+
+GROUP BY
+
+    author_id,
+    publication_year;
+
+
+/*==============================================================================
+SECTION 3. FOCAL AUTHOR x ACCEPTED YEAR
+==============================================================================
+
+We calculate prior OpenAlex productivity at author x year first, which avoids
+repeating a large historical calculation for every individual paper.
+==============================================================================*/
+
+CREATE OR REPLACE TABLE `redo.ai_focal_author_years`
+AS
+
+SELECT DISTINCT
+
+    author_id,
+
+    accepted_year
+
+FROM `redo.ai_paper_authors`
+
+WHERE author_id IS NOT NULL;
+
+
+/*==============================================================================
+SECTION 4. OPENALEX-WIDE RAW PRIOR PRODUCTIVITY
+==============================================================================*/
+
+CREATE OR REPLACE TABLE `redo.ai_openalex_prior_productivity`
+AS
+
+SELECT
+
+    f.author_id,
+
+    f.accepted_year,
+
+    COALESCE(
+        SUM(
+            a.article_review_papers
+        ),
+        0
+    ) AS openalex_prior_article_review_count
+
+FROM `redo.ai_focal_author_years` AS f
+
+LEFT JOIN `redo.ai_openalex_author_year` AS a
+
+    ON f.author_id = a.author_id
+
+    AND a.publication_year < f.accepted_year
+
+GROUP BY
+
+    f.author_id,
+    f.accepted_year;
+
+
+/*==============================================================================
+SECTION 5. OPENALEX PRIOR PRODUCTIVITY BINS
+==============================================================================*/
+
+CREATE OR REPLACE TABLE `redo.ai_openalex_prior_productivity_binned`
+AS
+
+SELECT
+
+    author_id,
+
+    accepted_year,
+
+    openalex_prior_article_review_count,
+
+
+    CASE
+
+        WHEN openalex_prior_article_review_count BETWEEN 0 AND 4
+            THEN '0-4'
+
+        WHEN openalex_prior_article_review_count BETWEEN 5 AND 9
+            THEN '5-9'
+
+        WHEN openalex_prior_article_review_count BETWEEN 10 AND 24
+            THEN '10-24'
+
+        WHEN openalex_prior_article_review_count BETWEEN 25 AND 49
+            THEN '25-49'
+
+        WHEN openalex_prior_article_review_count BETWEEN 50 AND 99
+            THEN '50-99'
+
+        WHEN openalex_prior_article_review_count >= 100
+            THEN '100+'
+
+        ELSE NULL
+
+    END AS prior_productivity_bin,
+
+
+    CASE
+
+        WHEN openalex_prior_article_review_count BETWEEN 0 AND 4
+            THEN 1
+
+        WHEN openalex_prior_article_review_count BETWEEN 5 AND 9
+            THEN 2
+
+        WHEN openalex_prior_article_review_count BETWEEN 10 AND 24
+            THEN 3
+
+        WHEN openalex_prior_article_review_count BETWEEN 25 AND 49
+            THEN 4
+
+        WHEN openalex_prior_article_review_count BETWEEN 50 AND 99
+            THEN 5
+
+        WHEN openalex_prior_article_review_count >= 100
+            THEN 6
+
+        ELSE NULL
+
+    END AS prior_productivity_bin_order
+
+FROM `redo.ai_openalex_prior_productivity`;
+
+
