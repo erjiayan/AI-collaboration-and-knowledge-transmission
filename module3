@@ -1,0 +1,1435 @@
+/*==============================================================================
+M3. AUTHOR HISTORY / CAREER / PRIOR COLLABORATION
+==============================================================================
+
+PROJECT
+-------
+Generative AI, scientific collaboration, and scientific knowledge retention.
+
+INPUT
+-----
+Primary:
+    redo.ai_paper_authors
+
+OpenAlex:
+    subugoe-collaborative.openalex_walden.works
+
+OUTPUT
+------
+    redo.ai_openalex_author_career
+    redo.ai_openalex_author_year
+    redo.ai_focal_author_years
+    redo.ai_openalex_prior_productivity
+    redo.ai_openalex_prior_productivity_binned
+
+    redo.ai_author_paper_stage
+    redo.ai_author_rolling_history_stage
+
+    redo.ai_baseline_author_profile
+    redo.ai_baseline_author_profile_final
+    redo.ai_baseline_team_categories
+    redo.ai_baseline_team_mode
+
+    redo.ai_author_history
+    redo.ai_author_history_core
+
+==============================================================================
+
+GRAIN
+-----
+Final M3:
+    one row per paper x distinct resolved OpenAlex author.
+
+==============================================================================
+
+AI TIMING
+---------
+All AI-period timing uses accepted_date from redo.aiscore as carried through M1.
+
+BASELINE:
+    2010 Q1 - 2022 Q3
+    accepted_date <= 2022-09-30
+
+TRANSITION:
+    2022 Q4 - 2023 Q2
+    2022-10-01 through 2023-06-30
+
+POST:
+    2023 Q3 onward
+    accepted_date >= 2023-07-01
+
+==============================================================================
+
+CAREER STAGE
+------------
+OpenAlex-wide first article/review publication year.
+
+Career-stage bins:
+
+    0-5
+    6-10
+    11-19
+    20-29
+    30+
+
+The exact approximate_career_age is retained for QC and sensitivity analyses.
+
+==============================================================================
+
+OPENALEX-WIDE PRIOR PRODUCTIVITY
+--------------------------------
+For a focal paper accepted in calendar year Y:
+
+    prior OpenAlex article/review publications =
+        publication_year < Y
+
+Same-calendar-year OpenAlex publications are excluded because OpenAlex does
+not provide a directly comparable historical acceptance date for the full
+OpenAlex corpus.
+
+Both are retained:
+
+    1. raw prior publication count
+    2. binned prior publication count
+
+Bins:
+
+    0-4
+    5-9
+    10-24
+    25-49
+    50-99
+    100+
+
+==============================================================================
+
+STUDY-CORPUS PRIOR HISTORY
+---------------------------
+For a focal paper accepted on date T:
+
+    prior = accepted_date < T
+
+Same-day papers are therefore excluded.
+
+These rolling collaboration variables are based on the 2010-2025 study corpus.
+
+==============================================================================
+
+AUTHORSHIP RESOLUTION
+---------------------
+The corrected M2 has:
+
+    one row per paper x distinct resolved author.
+
+M2's complete_authorship variable means:
+
+    distinct resolved authors = OpenAlex authors_count.
+
+In M3 this is explicitly renamed:
+
+    all_authors_resolved
+
+No reliance is placed on OpenAlex's authorships_truncated field because it is
+NULL throughout this snapshot.
+
+==============================================================================
+
+IMPORTANT
+---------
+Current OpenAlex cited_by_count is NOT used as prior author impact.
+
+==============================================================================*/
+
+
+/*==============================================================================
+SECTION 1. OPENALEX AUTHOR CAREER START
+==============================================================================
+
+Purpose:
+    establish OpenAlex-wide career start for every author appearing in M2.
+
+Career start is based on the earliest OpenAlex-indexed article or review.
+
+==============================================================================*/
+
+CREATE OR REPLACE TABLE `redo.ai_openalex_author_career`
+AS
+
+SELECT
+
+    REPLACE(
+        au.author.id,
+        'https://openalex.org/',
+        ''
+    ) AS author_id,
+
+    MIN(
+        w.publication_year
+    ) AS openalex_first_article_review_year,
+
+    MIN(
+        SAFE_CAST(
+            w.publication_date AS DATE
+        )
+    ) AS openalex_first_article_review_date,
+
+    COUNT(
+        DISTINCT w.id
+    ) AS openalex_total_article_review_count
+
+FROM `subugoe-collaborative.openalex_walden.works` AS w
+
+CROSS JOIN UNNEST(
+    w.authorships
+) AS au
+
+INNER JOIN (
+
+    SELECT DISTINCT
+        author_id
+    FROM `redo.ai_paper_authors`
+    WHERE author_id IS NOT NULL
+
+) AS study_authors
+
+    ON REPLACE(
+        au.author.id,
+        'https://openalex.org/',
+        ''
+    ) = study_authors.author_id
+
+WHERE
+
+    au.author.id IS NOT NULL
+
+    AND LOWER(w.type) IN (
+        'article',
+        'review'
+    )
+
+    AND w.publication_year IS NOT NULL
+
+    AND w.publication_year BETWEEN 1900 AND 2025
+
+    AND w.is_retracted IS NOT TRUE
+
+    AND w.is_paratext IS NOT TRUE
+
+GROUP BY
+    author_id;
+
+
+/*==============================================================================
+SECTION 2. OPENALEX AUTHOR-YEAR PUBLICATION COUNTS
+==============================================================================
+
+Grain:
+    one author x one OpenAlex publication year.
+
+COUNT(DISTINCT w.id) prevents any duplicated authorship appearances from
+inflating an author's publication count.
+==============================================================================*/
+
+CREATE OR REPLACE TABLE `redo.ai_openalex_author_year`
+AS
+
+SELECT
+
+    REPLACE(
+        au.author.id,
+        'https://openalex.org/',
+        ''
+    ) AS author_id,
+
+    w.publication_year,
+
+    COUNT(
+        DISTINCT w.id
+    ) AS article_review_papers
+
+FROM `subugoe-collaborative.openalex_walden.works` AS w
+
+CROSS JOIN UNNEST(
+    w.authorships
+) AS au
+
+INNER JOIN (
+
+    SELECT DISTINCT
+        author_id
+    FROM `redo.ai_paper_authors`
+    WHERE author_id IS NOT NULL
+
+) AS study_authors
+
+    ON REPLACE(
+        au.author.id,
+        'https://openalex.org/',
+        ''
+    ) = study_authors.author_id
+
+WHERE
+
+    au.author.id IS NOT NULL
+
+    AND LOWER(w.type) IN (
+        'article',
+        'review'
+    )
+
+    AND w.publication_year IS NOT NULL
+
+    AND w.publication_year BETWEEN 1900 AND 2025
+
+    AND w.is_retracted IS NOT TRUE
+
+    AND w.is_paratext IS NOT TRUE
+
+GROUP BY
+
+    author_id,
+    publication_year;
+
+/*==============================================================================
+M3 FINAL REBUILD
+==============================================================================
+
+PURPOSE
+-------
+Build the final author-history table after correcting the OpenAlex career-age
+measure.
+
+M2 is already complete and frozen:
+    redo.ai_paper_authors
+
+This script rebuilds M3 only.
+
+IMPORTANT
+---------
+No large OpenAlex works scan is performed here.
+
+It reuses the already-created:
+    redo.ai_openalex_author_year
+    redo.ai_openalex_author_career
+    redo.ai_openalex_prior_productivity_binned
+    redo.ai_author_rolling_history_stage
+    redo.ai_baseline_author_profile_final
+    redo.ai_baseline_team_mode
+
+CAREER AGE
+----------
+For focal accepted year Y:
+
+    first OpenAlex article/review year <= Y
+
+If none exists:
+    career start = NULL
+    career age = NULL
+    career stage = NULL
+
+This prevents future OpenAlex publications from creating negative career ages.
+
+CAREER STAGE
+------------
+0-5
+6-10
+11-19
+20-29
+30+
+
+PRODUCTIVITY
+------------
+Raw total OpenAlex article/review count is retained.
+
+Raw prior OpenAlex article/review count is retained.
+
+Prior productivity bins:
+0-4
+5-9
+10-24
+25-49
+50-99
+100+
+
+==============================================================================*/
+
+
+/*==============================================================================
+SECTION 1. FOCAL AUTHOR x ACCEPTED YEAR
+==============================================================================*/
+
+CREATE OR REPLACE TABLE `redo.ai_focal_author_years`
+AS
+
+SELECT DISTINCT
+
+    author_id,
+
+    accepted_year
+
+FROM `redo.ai_paper_authors`
+
+WHERE author_id IS NOT NULL;
+
+
+/*==============================================================================
+SECTION 2. TEMPORALLY VALID OPENALEX CAREER START
+==============================================================================
+
+For each author x focal accepted year:
+
+    earliest OpenAlex article/review published on or before focal year.
+
+We use publication_year because the complete OpenAlex historical corpus does
+not provide a comparable accepted_date.
+
+==============================================================================*/
+
+CREATE OR REPLACE TABLE `redo.ai_openalex_career_by_author_year`
+AS
+
+SELECT
+
+    f.author_id,
+
+    f.accepted_year,
+
+    MIN(
+        a.publication_year
+    ) AS openalex_first_article_review_year_by_focal_year
+
+FROM `redo.ai_focal_author_years` AS f
+
+LEFT JOIN `redo.ai_openalex_author_year` AS a
+
+    ON f.author_id = a.author_id
+
+    AND a.publication_year <= f.accepted_year
+
+GROUP BY
+
+    f.author_id,
+
+    f.accepted_year;
+
+
+/*==============================================================================
+SECTION 3. REBUILD FINAL M3
+==============================================================================*/
+
+CREATE OR REPLACE TABLE `redo.ai_author_history`
+
+CLUSTER BY
+    author_id,
+    accepted_year,
+    subfield_id
+
+AS
+
+SELECT
+
+    /*==========================================================================
+      IDENTIFIERS
+    ==========================================================================*/
+
+    h.openalex_id,
+
+    h.article_pmc,
+
+    h.author_id,
+
+
+    /*==========================================================================
+      AUTHOR ROLE
+    ==========================================================================*/
+
+    h.is_first_author,
+
+    h.is_last_author,
+
+    h.is_corresponding_author,
+
+    h.is_first_corresponding,
+
+    h.is_last_corresponding,
+
+    h.primary_author_country,
+
+    h.primary_author_institution_id,
+
+
+    /*==========================================================================
+      PAPER TIMING
+    ==========================================================================*/
+
+    h.accepted_date,
+
+    h.accepted_year,
+
+    h.accepted_quarter,
+
+    h.accepted_month,
+
+    h.accepted_month_date,
+
+    h.accepted_quarter_date,
+
+    h.accepted_year_quarter,
+
+    h.ai_era,
+
+
+    /*==========================================================================
+      AI
+    ==========================================================================*/
+
+    h.ai_score,
+
+    h.n_ai_sentences,
+
+    h.log_ai_sentences,
+
+
+    /*==========================================================================
+      PAPER TYPE
+    ==========================================================================*/
+
+    h.work_type,
+
+    h.is_article,
+
+    h.is_review,
+
+
+    /*==========================================================================
+      TEAM / AUTHORSHIP QUALITY
+    ==========================================================================*/
+
+    h.authors_count,
+
+    h.team_size_category,
+
+    h.team_middle_4_6,
+
+    h.authorship_dedup_required,
+
+    h.all_authors_resolved,
+
+
+    /*==========================================================================
+      DISCIPLINE
+    ==========================================================================*/
+
+    h.topic_id,
+
+    h.subfield_id,
+
+    h.field_id,
+
+    h.domain_id,
+
+
+    /*==========================================================================
+      JOURNAL
+    ==========================================================================*/
+
+    h.source_id,
+
+    h.source_name,
+
+
+    /*==============================================================================
+      OPENALEX-WIDE CAREER
+==============================================================================*/
+
+cy.openalex_first_article_review_year_by_focal_year
+    AS openalex_first_article_review_year,
+
+
+/*
+Raw total number of article/review works observed for the author across
+the OpenAlex history available in this snapshot.
+
+Descriptive/raw measure only.
+*/
+
+oa.openalex_total_article_review_count,
+
+
+/*==============================================================================
+      OPENALEX-OBSERVED CAREER AGE
+==============================================================================*/
+
+/*
+Definition:
+
+    career age = focal accepted year
+                 - earliest OpenAlex article/review year observed
+                   on or before the focal year.
+
+When no qualifying prior article/review is observed:
+
+    career age = 0
+
+This does NOT claim that the author's true career literally began in the
+focal year. It means that no earlier qualifying publication is observed
+in the available OpenAlex author history by that focal year.
+*/
+
+CASE
+
+    WHEN
+        cy.openalex_first_article_review_year_by_focal_year IS NULL
+
+        THEN 0
+
+    ELSE
+
+        h.accepted_year
+        -
+        cy.openalex_first_article_review_year_by_focal_year
+
+END AS approximate_career_age,
+
+
+/*==============================================================================
+      CAREER-STAGE
+==============================================================================*/
+
+CASE
+
+    /*
+    No prior OpenAlex article/review observed by focal year.
+
+    Classified as 0-5 because the observed career age is defined as 0.
+    */
+
+    WHEN
+        cy.openalex_first_article_review_year_by_focal_year IS NULL
+
+        THEN '0-5'
+
+
+    WHEN
+        h.accepted_year
+        -
+        cy.openalex_first_article_review_year_by_focal_year
+        BETWEEN 0 AND 5
+
+        THEN '0-5'
+
+
+    WHEN
+        h.accepted_year
+        -
+        cy.openalex_first_article_review_year_by_focal_year
+        BETWEEN 6 AND 10
+
+        THEN '6-10'
+
+
+    WHEN
+        h.accepted_year
+        -
+        cy.openalex_first_article_review_year_by_focal_year
+        BETWEEN 11 AND 19
+
+        THEN '11-19'
+
+
+    WHEN
+        h.accepted_year
+        -
+        cy.openalex_first_article_review_year_by_focal_year
+        BETWEEN 20 AND 29
+
+        THEN '20-29'
+
+
+    WHEN
+        h.accepted_year
+        -
+        cy.openalex_first_article_review_year_by_focal_year
+        >= 30
+
+        THEN '30+'
+
+
+    ELSE NULL
+
+END AS career_stage,
+
+
+/*==============================================================================
+      CAREER-STAGE ORDER
+==============================================================================*/
+
+CASE
+
+    WHEN
+        cy.openalex_first_article_review_year_by_focal_year IS NULL
+
+        THEN 1
+
+
+    WHEN
+        h.accepted_year
+        -
+        cy.openalex_first_article_review_year_by_focal_year
+        BETWEEN 0 AND 5
+
+        THEN 1
+
+
+    WHEN
+        h.accepted_year
+        -
+        cy.openalex_first_article_review_year_by_focal_year
+        BETWEEN 6 AND 10
+
+        THEN 2
+
+
+    WHEN
+        h.accepted_year
+        -
+        cy.openalex_first_article_review_year_by_focal_year
+        BETWEEN 11 AND 19
+
+        THEN 3
+
+
+    WHEN
+        h.accepted_year
+        -
+        cy.openalex_first_article_review_year_by_focal_year
+        BETWEEN 20 AND 29
+
+        THEN 4
+
+
+    WHEN
+        h.accepted_year
+        -
+        cy.openalex_first_article_review_year_by_focal_year
+        >= 30
+
+        THEN 5
+
+
+    ELSE NULL
+
+END AS career_stage_order,
+
+
+/*==============================================================================
+      CAREER-HISTORY AVAILABILITY FLAG
+==============================================================================*/
+
+/*
+TRUE:
+    No qualifying OpenAlex article/review observed by the focal year.
+
+This is retained so SI analyses can distinguish:
+
+    observed age = 0
+
+from
+
+    age = 0 because the prior OpenAlex history is unobserved.
+*/
+
+CASE
+
+    WHEN
+        cy.openalex_first_article_review_year_by_focal_year IS NULL
+
+        THEN TRUE
+
+    ELSE FALSE
+
+END AS career_start_unobserved_by_focal_year,
+
+
+/*==============================================================================
+      CAREER-AGE DIAGNOSTIC
+==============================================================================*/
+
+/*
+Observations with implied age >70 remain in the data and remain classified
+according to the broad career-stage bins.
+
+This flag is diagnostic for sensitivity analyses.
+*/
+
+CASE
+
+    WHEN
+        cy.openalex_first_article_review_year_by_focal_year IS NOT NULL
+
+        AND
+        h.accepted_year
+        -
+        cy.openalex_first_article_review_year_by_focal_year
+        > 70
+
+        THEN TRUE
+
+    ELSE FALSE
+
+END AS career_age_over_70,
+
+
+    /*==========================================================================
+      OPENALEX-WIDE PRIOR PRODUCTIVITY
+    ==========================================================================*/
+
+    COALESCE(
+        prod.openalex_prior_article_review_count,
+        0
+    ) AS openalex_prior_article_review_count,
+
+    prod.prior_productivity_bin,
+
+    prod.prior_productivity_bin_order,
+
+
+    /*==========================================================================
+      STRICTLY PRIOR STUDY-CORPUS HISTORY
+    ==========================================================================*/
+
+    COALESCE(
+        h.prior_corpus_papers,
+        0
+    ) AS prior_corpus_papers,
+
+    COALESCE(
+        h.prior_first_author_papers,
+        0
+    ) AS prior_first_author_papers,
+
+    COALESCE(
+        h.prior_last_author_papers,
+        0
+    ) AS prior_last_author_papers,
+
+    COALESCE(
+        h.prior_corresponding_papers,
+        0
+    ) AS prior_corresponding_papers,
+
+
+    /*==========================================================================
+      PRIOR TEAM HISTORY
+    ==========================================================================*/
+
+    COALESCE(
+        h.prior_team_papers,
+        0
+    ) AS prior_team_papers,
+
+    COALESCE(
+        h.prior_sum_authors,
+        0
+    ) AS prior_sum_authors,
+
+    SAFE_DIVIDE(
+        h.prior_sum_authors,
+        h.prior_team_papers
+    ) AS prior_mean_team_size,
+
+
+    /*==========================================================================
+      PRIOR TEAM DISTRIBUTION
+    ==========================================================================*/
+
+    COALESCE(
+        h.prior_solo_papers,
+        0
+    ) AS prior_solo_papers,
+
+    COALESCE(
+        h.prior_2_3_papers,
+        0
+    ) AS prior_2_3_papers,
+
+    COALESCE(
+        h.prior_4_6_papers,
+        0
+    ) AS prior_4_6_papers,
+
+    COALESCE(
+        h.prior_7_10_papers,
+        0
+    ) AS prior_7_10_papers,
+
+    COALESCE(
+        h.prior_11_19_papers,
+        0
+    ) AS prior_11_19_papers,
+
+    COALESCE(
+        h.prior_20plus_papers,
+        0
+    ) AS prior_20plus_papers,
+
+
+    /*==========================================================================
+      PRIOR TEAM SHARES
+    ==========================================================================*/
+
+    SAFE_DIVIDE(
+        h.prior_solo_papers,
+        h.prior_team_papers
+    ) AS prior_solo_share,
+
+    SAFE_DIVIDE(
+        h.prior_2_3_papers,
+        h.prior_team_papers
+    ) AS prior_2_3_share,
+
+    SAFE_DIVIDE(
+        h.prior_4_6_papers,
+        h.prior_team_papers
+    ) AS prior_4_6_share,
+
+    SAFE_DIVIDE(
+        h.prior_7_10_papers,
+        h.prior_team_papers
+    ) AS prior_7_10_share,
+
+    SAFE_DIVIDE(
+        h.prior_11_19_papers,
+        h.prior_team_papers
+    ) AS prior_11_19_share,
+
+    SAFE_DIVIDE(
+        h.prior_20plus_papers,
+        h.prior_team_papers
+    ) AS prior_20plus_share,
+
+
+    /*==========================================================================
+      FIXED PRE-DIFFUSION PROFILE
+    ==========================================================================*/
+
+    b.baseline_papers,
+
+    b.baseline_first_author_papers,
+
+    b.baseline_last_author_papers,
+
+    b.baseline_corresponding_papers,
+
+    b.baseline_team_papers,
+
+    b.baseline_mean_team_size,
+
+    b.baseline_median_team_size,
+
+    b.baseline_solo_papers,
+
+    b.baseline_2_3_papers,
+
+    b.baseline_4_6_papers,
+
+    b.baseline_7_10_papers,
+
+    b.baseline_11_19_papers,
+
+    b.baseline_20plus_papers,
+
+    b.baseline_solo_share,
+
+    b.baseline_2_3_share,
+
+    b.baseline_4_6_share,
+
+    b.baseline_7_10_share,
+
+    b.baseline_11_19_share,
+
+    b.baseline_20plus_share,
+
+    b.adequate_baseline_team_history,
+
+    b.strong_baseline_team_history,
+
+    m.baseline_modal_team_regime,
+
+
+    /*==========================================================================
+      AUTHOR PANEL COUNTS
+    ==========================================================================*/
+
+    COUNTIF(
+        h.accepted_date <= DATE '2022-09-30'
+    ) OVER (
+        PARTITION BY h.author_id
+    ) AS n_baseline_papers_author,
+
+
+    COUNTIF(
+        h.accepted_date BETWEEN
+            DATE '2022-10-01'
+            AND DATE '2023-06-30'
+    ) OVER (
+        PARTITION BY h.author_id
+    ) AS n_transition_papers_author,
+
+
+    COUNTIF(
+        h.accepted_date >= DATE '2023-07-01'
+    ) OVER (
+        PARTITION BY h.author_id
+    ) AS n_post_papers_author,
+
+
+    /*==========================================================================
+      PERIOD FLAGS
+    ==========================================================================*/
+
+    (
+        COUNTIF(
+            h.accepted_date <= DATE '2022-09-30'
+        ) OVER (
+            PARTITION BY h.author_id
+        ) > 0
+    ) AS has_baseline_paper,
+
+
+    (
+        COUNTIF(
+            h.accepted_date BETWEEN
+                DATE '2022-10-01'
+                AND DATE '2023-06-30'
+        ) OVER (
+            PARTITION BY h.author_id
+        ) > 0
+    ) AS has_transition_paper,
+
+
+    (
+        COUNTIF(
+            h.accepted_date >= DATE '2023-07-01'
+        ) OVER (
+            PARTITION BY h.author_id
+        ) > 0
+    ) AS has_post_paper,
+
+
+    /*==========================================================================
+      BASELINE + POST STAYER
+    ==========================================================================*/
+
+    (
+        COUNTIF(
+            h.accepted_date <= DATE '2022-09-30'
+        ) OVER (
+            PARTITION BY h.author_id
+        ) > 0
+
+        AND
+
+        COUNTIF(
+            h.accepted_date >= DATE '2023-07-01'
+        ) OVER (
+            PARTITION BY h.author_id
+        ) > 0
+    ) AS has_baseline_and_post_paper,
+
+
+    /*==========================================================================
+      STRONG STAYER
+    ==========================================================================*/
+
+    (
+        COUNTIF(
+            h.accepted_date <= DATE '2022-09-30'
+        ) OVER (
+            PARTITION BY h.author_id
+        ) >= 2
+
+        AND
+
+        COUNTIF(
+            h.accepted_date >= DATE '2023-07-01'
+        ) OVER (
+            PARTITION BY h.author_id
+        ) >= 2
+    ) AS has_2plus_baseline_and_post_papers,
+
+
+    /*==========================================================================
+      BASELINE HISTORY QUALITY
+    ==========================================================================*/
+
+    (
+        b.baseline_team_papers >= 3
+    ) AS has_3plus_baseline_papers,
+
+
+    (
+        b.baseline_team_papers >= 5
+    ) AS has_5plus_baseline_papers
+
+
+FROM `redo.ai_author_rolling_history_stage` AS h
+
+
+/*==============================================================================
+JOIN 1. TEMPORALLY VALID CAREER START
+==============================================================================*/
+
+LEFT JOIN `redo.ai_openalex_career_by_author_year` AS cy
+
+    ON h.author_id = cy.author_id
+
+    AND h.accepted_year = cy.accepted_year
+
+
+/*==============================================================================
+JOIN 2. OPENALEX-WIDE RAW TOTAL PUBLICATION COUNT
+==============================================================================*/
+
+LEFT JOIN `redo.ai_openalex_author_career` AS oa
+
+    ON h.author_id = oa.author_id
+
+
+/*==============================================================================
+JOIN 3. OPENALEX-WIDE PRIOR PRODUCTIVITY
+==============================================================================*/
+
+LEFT JOIN `redo.ai_openalex_prior_productivity_binned` AS prod
+
+    ON h.author_id = prod.author_id
+
+    AND h.accepted_year = prod.accepted_year
+
+
+/*==============================================================================
+JOIN 4. FIXED BASELINE PROFILE
+==============================================================================*/
+
+LEFT JOIN `redo.ai_baseline_author_profile_final` AS b
+
+    ON h.author_id = b.author_id
+
+
+/*==============================================================================
+JOIN 5. BASELINE MODAL TEAM REGIME
+==============================================================================*/
+
+LEFT JOIN `redo.ai_baseline_team_mode` AS m
+
+    ON h.author_id = m.author_id;
+
+
+/*==============================================================================
+SECTION 4. RECREATE COMPACT M3 VIEW
+==============================================================================*/
+
+CREATE OR REPLACE VIEW `redo.ai_author_history_core`
+AS
+
+SELECT
+
+    /*--------------------------------------------------------------------------
+      IDENTIFIERS
+    --------------------------------------------------------------------------*/
+
+    openalex_id,
+
+    article_pmc,
+
+    author_id,
+
+
+    /*--------------------------------------------------------------------------
+      AUTHOR ROLE
+    --------------------------------------------------------------------------*/
+
+    is_first_author,
+
+    is_last_author,
+
+    is_corresponding_author,
+
+    is_first_corresponding,
+
+    is_last_corresponding,
+
+    primary_author_country,
+
+    primary_author_institution_id,
+
+
+    /*--------------------------------------------------------------------------
+      PAPER TIMING
+    --------------------------------------------------------------------------*/
+
+    accepted_date,
+
+    accepted_year,
+
+    accepted_quarter,
+
+    accepted_month,
+
+    accepted_month_date,
+
+    accepted_quarter_date,
+
+    accepted_year_quarter,
+
+    ai_era,
+
+
+    /*--------------------------------------------------------------------------
+      AI
+    --------------------------------------------------------------------------*/
+
+    ai_score,
+
+    n_ai_sentences,
+
+    log_ai_sentences,
+
+
+    /*--------------------------------------------------------------------------
+      PAPER
+    --------------------------------------------------------------------------*/
+
+    work_type,
+
+    is_article,
+
+    is_review,
+
+
+    /*--------------------------------------------------------------------------
+      TEAM
+    --------------------------------------------------------------------------*/
+
+    authors_count,
+
+    team_size_category,
+
+    team_middle_4_6,
+
+    authorship_dedup_required,
+
+    all_authors_resolved,
+
+
+    /*--------------------------------------------------------------------------
+      DISCIPLINE
+    --------------------------------------------------------------------------*/
+
+    topic_id,
+
+    subfield_id,
+
+    field_id,
+
+    domain_id,
+
+
+    /*--------------------------------------------------------------------------
+      JOURNAL
+    --------------------------------------------------------------------------*/
+
+    source_id,
+
+    source_name,
+
+
+    /*--------------------------------------------------------------------------
+      OPENALEX CAREER
+    --------------------------------------------------------------------------*/
+
+    openalex_first_article_review_year,
+
+    openalex_total_article_review_count,
+
+    approximate_career_age,
+
+    career_stage,
+
+    career_stage_order,
+
+    career_age_over_70,
+
+
+    /*--------------------------------------------------------------------------
+      OPENALEX PRIOR PRODUCTIVITY
+    --------------------------------------------------------------------------*/
+
+    openalex_prior_article_review_count,
+
+    prior_productivity_bin,
+
+    prior_productivity_bin_order,
+
+
+    /*--------------------------------------------------------------------------
+      PRIOR STUDY-CORPUS HISTORY
+    --------------------------------------------------------------------------*/
+
+    prior_corpus_papers,
+
+    prior_first_author_papers,
+
+    prior_last_author_papers,
+
+    prior_corresponding_papers,
+
+    prior_team_papers,
+
+    prior_sum_authors,
+
+    prior_mean_team_size,
+
+    prior_solo_papers,
+
+    prior_2_3_papers,
+
+    prior_4_6_papers,
+
+    prior_7_10_papers,
+
+    prior_11_19_papers,
+
+    prior_20plus_papers,
+
+    prior_solo_share,
+
+    prior_2_3_share,
+
+    prior_4_6_share,
+
+    prior_7_10_share,
+
+    prior_11_19_share,
+
+    prior_20plus_share,
+
+
+    /*--------------------------------------------------------------------------
+      FIXED PRE-DIFFUSION PROFILE
+    --------------------------------------------------------------------------*/
+
+    baseline_papers,
+
+    baseline_first_author_papers,
+
+    baseline_last_author_papers,
+
+    baseline_corresponding_papers,
+
+    baseline_team_papers,
+
+    baseline_mean_team_size,
+
+    baseline_median_team_size,
+
+    baseline_solo_share,
+
+    baseline_2_3_share,
+
+    baseline_4_6_share,
+
+    baseline_7_10_share,
+
+    baseline_11_19_share,
+
+    baseline_20plus_share,
+
+    baseline_modal_team_regime,
+
+    adequate_baseline_team_history,
+
+    strong_baseline_team_history,
+
+
+    /*--------------------------------------------------------------------------
+      PANEL
+    --------------------------------------------------------------------------*/
+
+    n_baseline_papers_author,
+
+    n_transition_papers_author,
+
+    n_post_papers_author,
+
+    has_baseline_paper,
+
+    has_transition_paper,
+
+    has_post_paper,
+
+    has_baseline_and_post_paper,
+
+    has_2plus_baseline_and_post_papers,
+
+    has_3plus_baseline_papers,
+
+    has_5plus_baseline_papers
+
+FROM `redo.ai_author_history`;
+
+
+/*==============================================================================
+SECTION 5. FINAL CAREER QC
+
+This is the only QC needed immediately after the rebuild.
+
+Expected:
+    negative_age = 0
+
+Missing career stage is allowed because some OpenAlex author histories begin
+after the focal paper or cannot be established from the available OpenAlex
+record.
+
+Age > 70 is retained and flagged rather than automatically deleted.
+==============================================================================*/
+
+SELECT
+
+    CASE
+
+        WHEN approximate_career_age IS NULL
+            THEN 'missing'
+
+        WHEN approximate_career_age < 0
+            THEN 'negative'
+
+        WHEN approximate_career_age > 70
+            THEN 'over_70'
+
+        ELSE 'valid'
+
+    END AS career_age_status,
+
+    COUNT(*) AS n_author_paper_rows,
+
+    COUNT(DISTINCT author_id) AS n_authors,
+
+    MIN(approximate_career_age) AS min_age,
+
+    MAX(approximate_career_age) AS max_age
+
+FROM `redo.ai_author_history`
+
+GROUP BY career_age_status
+
+ORDER BY
+
+    CASE career_age_status
+        WHEN 'negative' THEN 1
+        WHEN 'missing' THEN 2
+        WHEN 'over_70' THEN 3
+        WHEN 'valid' THEN 4
+        ELSE 5
+    END;
