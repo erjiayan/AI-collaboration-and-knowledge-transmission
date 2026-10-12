@@ -1,0 +1,1533 @@
+/*==============================================================================
+M1. AI PAPERS MASTER TABLE
+==============================================================================
+
+PROJECT
+-------
+Generative AI, scientific collaboration, and scientific knowledge retention.
+
+PURPOSE
+-------
+Construct the master paper-level table linking the PMC AI-writing-score corpus
+to OpenAlex.
+
+TABLE CREATED
+-------------
+    redo.ai_papers_master
+
+GRAIN
+-----
+One row = one eligible PMC/OpenAlex paper.
+
+STUDY PERIOD
+------------
+Accepted between:
+
+    2010-01-01 and 2025-12-31
+
+The small number of records with 2026 acceptance dates are excluded.
+
+DATA SOURCES
+------------
+AI-score data:
+    redo.aiscore
+
+OpenAlex:
+    subugoe-collaborative.openalex_walden.works
+
+
+==============================================================================
+CORE SAMPLE DEFINITION
+==============================================================================
+
+The original AI-score corpus was constructed using:
+
+    1. journal publications;
+    2. article or review;
+    3. English-language publications;
+    4. at least 3 references.
+
+M1 preserves this research universe.
+
+Because English/journal eligibility was imposed when the AI-score source was
+constructed, M1 does not independently redefine those criteria from OpenAlex.
+
+We additionally exclude:
+
+    - retracted works;
+    - paratext.
+
+IMPORTANT:
+authorships_truncated = TRUE is NOT excluded from M1.
+
+Complete authorship is necessary for some team/author analyses but not for all
+citation analyses. Instead, M1 contains explicit eligibility flags so each
+analysis uses the largest sample appropriate for its estimand.
+
+
+==============================================================================
+AI-SCORE INTERPRETATION
+==============================================================================
+
+ai_use_intro_discussion is the text-derived AI-use score calculated from the
+combined Introduction and Discussion sections.
+
+The score is retained in its original 0-1 scale.
+
+IMPORTANT TEMPORAL INTERPRETATION:
+
+Before widespread generative-AI diffusion, positive score values cannot be
+interpreted as evidence that authors used contemporary generative AI.
+
+Pre-diffusion values instead characterize the classifier/background signal that
+existed before widespread generative-AI availability.
+
+Therefore:
+
+    - raw historical scores are retained;
+    - they are NOT mechanically set to zero;
+    - they are NOT described as pre-2022 AI use;
+    - they provide a historical baseline for later calibration, placebo tests,
+      and tests of whether score-outcome relationships existed before diffusion.
+
+A calibrated/excess AI score may later be constructed as a robustness measure,
+but it is deliberately NOT created in M1.
+
+
+==============================================================================
+PRIMARY AI TIMING
+==============================================================================
+
+Timing is based exclusively on accepted_date from redo.aiscore.
+
+BASELINE:
+    2010-01-01 through 2022-09-30
+    = through 2022 Q3
+
+TRANSITION:
+    2022-10-01 through 2023-06-30
+    = 2022 Q4 through 2023 Q2
+
+POST-DIFFUSION:
+    2023-07-01 onward
+    = 2023 Q3 through 2025 Q4
+
+The transition period remains in M1 and in dynamic quarterly analyses, but can
+be excluded from the principal baseline-versus-post comparison.
+
+The timing convention distinguishes:
+
+    - public availability of generative AI beginning in late 2022;
+    - the transitional manuscript-production period;
+    - the pronounced diffusion period visible in the AI-score distribution.
+
+Alternative transition windows will be examined in SI.
+
+
+==============================================================================
+PUBLICATION DATE
+==============================================================================
+
+OpenAlex publication_date contains substantial inconsistencies relative to
+accepted_date.
+
+Therefore:
+
+    accepted_date = manuscript/AI timing variable.
+
+OpenAlex publication_date is NEVER used to determine:
+
+    - AI era;
+    - historical treatment period;
+    - quarterly AI timing;
+    - team-analysis timing.
+
+publication_date is retained only because later forward-citation analyses need
+a measure of when a paper became available to receive citations.
+
+Publication-date validity for citation-window construction will be addressed
+later when M4 is constructed.
+
+
+==============================================================================
+DOWNSTREAM TABLE ARCHITECTURE
+==============================================================================
+
+M1:
+    redo.ai_papers_master
+    paper-level research universe
+
+M2:
+    redo.ai_paper_authors
+    one row per paper x author
+
+M3:
+    redo.ai_author_history
+    prior-only author characteristics
+
+M4:
+    redo.ai_citation_pairs
+    one row per focal paper x citing paper
+
+D1:
+    redo.ai_predecessor_pairs
+    one row per focal paper x predecessor
+
+D2:
+    redo.ai_citation_summary
+    one row per focal paper with citation-window outcomes
+
+==============================================================================*/
+
+
+/*==============================================================================
+SECTION 0. PARAMETERS
+==============================================================================*/
+
+DECLARE study_start_date DATE DEFAULT DATE '2010-01-01';
+DECLARE study_end_date   DATE DEFAULT DATE '2025-12-31';
+
+-- Last day of historical baseline period.
+DECLARE baseline_end_date DATE DEFAULT DATE '2022-09-30';
+
+-- Last day of transition period.
+DECLARE transition_end_date DATE DEFAULT DATE '2023-06-30';
+
+
+/*==============================================================================
+SECTION 1. AI-SCORE SOURCE
+==============================================================================*/
+
+CREATE TEMP TABLE ai_source AS
+
+SELECT
+
+    openalex_id,
+
+    article_pmc,
+
+    accepted_date,
+
+    ai_use_intro_discussion
+        AS ai_score,
+
+    sentences_intro_discussion
+        AS n_ai_sentences
+
+FROM `redo.aiscore`
+
+WHERE
+    accepted_date BETWEEN study_start_date AND study_end_date;
+
+
+/*==============================================================================
+SECTION 2. OPENALEX SOURCE
+==============================================================================*/
+
+CREATE TEMP TABLE oa_source AS
+
+SELECT
+
+    /*--------------------------------------------------------------------------
+      OpenAlex identifier
+
+      redo.aiscore uses IDs such as:
+          W4323907135
+
+      OpenAlex may store:
+          https://openalex.org/W4323907135
+
+      Normalize to W... form.
+    --------------------------------------------------------------------------*/
+
+    REPLACE(
+        w.id,
+        'https://openalex.org/',
+        ''
+    ) AS openalex_id,
+
+
+    /*==========================================================================
+      PUBLICATION METADATA
+    ==========================================================================*/
+
+    SAFE_CAST(
+        w.publication_date AS DATE
+    ) AS publication_date,
+
+    w.publication_year,
+
+    w.title,
+
+    w.type AS work_type,
+
+
+    /*==========================================================================
+      AUTHORSHIP
+    ==========================================================================*/
+
+    w.authors_count,
+
+    w.authorships_truncated,
+
+    w.authorships,
+
+    w.corresponding_author_ids,
+
+    w.corresponding_institution_ids,
+
+    w.countries_distinct_count,
+
+    w.institutions_distinct_count,
+
+
+    /*==========================================================================
+      OPENALEX TOPIC HIERARCHY
+    ==========================================================================*/
+
+    w.primary_topic.id
+        AS topic_id,
+
+    w.primary_topic.display_name
+        AS topic_name,
+
+    w.primary_topic.subfield.id
+        AS subfield_id,
+
+    w.primary_topic.subfield.display_name
+        AS subfield_name,
+
+    w.primary_topic.field.id
+        AS field_id,
+
+    w.primary_topic.field.display_name
+        AS field_name,
+
+    w.primary_topic.domain.id
+        AS domain_id,
+
+    w.primary_topic.domain.display_name
+        AS domain_name,
+
+
+    /*==========================================================================
+      JOURNAL / SOURCE
+    ==========================================================================*/
+
+    w.primary_location.source.id
+        AS source_id,
+
+    w.primary_location.source.display_name
+        AS source_name,
+
+    w.primary_location.source.is_core
+        AS source_is_core,
+
+    w.primary_location.source.is_oa
+        AS source_is_oa,
+
+
+    /*==========================================================================
+      REFERENCES / CITATIONS
+    ==========================================================================*/
+
+    w.referenced_works,
+
+    w.referenced_works_count,
+
+    w.cited_by_count,
+
+
+    /*==========================================================================
+      STATUS
+    ==========================================================================*/
+
+    w.is_retracted,
+
+    w.is_paratext,
+
+    w.is_xpac,
+
+    -- Overall OA status is nested under open_access.
+    w.open_access.is_oa
+        AS is_oa,
+
+
+    /*==========================================================================
+      IDENTIFIERS
+    ==========================================================================*/
+
+    w.doi,
+
+    w.ids
+
+FROM `subugoe-collaborative.openalex_walden.works` AS w;
+
+
+/*==============================================================================
+SECTION 3. CREATE M1
+==============================================================================*/
+
+CREATE OR REPLACE TABLE `redo.ai_papers_master`
+
+CLUSTER BY
+    accepted_year,
+    subfield_id,
+    source_id,
+    first_author_id
+
+AS
+
+SELECT
+
+    /*==========================================================================
+      IDENTIFIERS
+    ==========================================================================*/
+
+    a.openalex_id,
+
+    a.article_pmc,
+
+
+    /*==========================================================================
+      ACCEPTANCE TIMING
+
+      IMPORTANT:
+      All AI-era and historical analyses use these variables.
+    ==========================================================================*/
+
+    a.accepted_date,
+
+    EXTRACT(
+        YEAR FROM a.accepted_date
+    ) AS accepted_year,
+
+    EXTRACT(
+        QUARTER FROM a.accepted_date
+    ) AS accepted_quarter,
+
+    EXTRACT(
+        MONTH FROM a.accepted_date
+    ) AS accepted_month,
+
+    DATE_TRUNC(
+        a.accepted_date,
+        MONTH
+    ) AS accepted_month_date,
+
+    DATE_TRUNC(
+        a.accepted_date,
+        QUARTER
+    ) AS accepted_quarter_date,
+
+    DATE_TRUNC(
+        a.accepted_date,
+        YEAR
+    ) AS accepted_year_date,
+
+    CONCAT(
+        CAST(
+            EXTRACT(YEAR FROM a.accepted_date)
+            AS STRING
+        ),
+        'Q',
+        CAST(
+            EXTRACT(QUARTER FROM a.accepted_date)
+            AS STRING
+        )
+    ) AS accepted_year_quarter,
+
+
+    /*==========================================================================
+      AI ERA
+
+      baseline:
+          through 2022 Q3
+
+      transition:
+          2022 Q4 through 2023 Q2
+
+      post:
+          2023 Q3 onward
+    ==========================================================================*/
+
+    CASE
+
+        WHEN a.accepted_date <= baseline_end_date
+            THEN 'baseline'
+
+        WHEN a.accepted_date <= transition_end_date
+            THEN 'transition'
+
+        ELSE 'post'
+
+    END AS ai_era,
+
+
+    /*==========================================================================
+      PUBLICATION TIMING
+
+      Retained for future citation-window construction only.
+
+      NOT used for AI-era assignment.
+    ==========================================================================*/
+
+    o.publication_date,
+
+    o.publication_year,
+
+    CASE
+        WHEN o.publication_date IS NOT NULL
+        THEN DATE_DIFF(
+            o.publication_date,
+            a.accepted_date,
+            DAY
+        )
+        ELSE NULL
+    END AS accept_to_publish_days,
+
+
+    /*--------------------------------------------------------------------------
+      Publication-date consistency flag.
+
+      This is descriptive/data-quality information only.
+
+      It is NOT yet a citation-eligibility criterion.
+    --------------------------------------------------------------------------*/
+
+    CASE
+
+        WHEN o.publication_date IS NOT NULL
+             AND o.publication_date >= a.accepted_date
+            THEN TRUE
+
+        ELSE FALSE
+
+    END AS publication_date_consistent,
+
+
+    CASE
+
+        WHEN o.publication_date IS NOT NULL
+             AND o.publication_date < a.accepted_date
+            THEN TRUE
+
+        ELSE FALSE
+
+    END AS publication_before_acceptance,
+
+
+    /*==========================================================================
+      AI EXPOSURE
+    ==========================================================================*/
+
+    a.ai_score,
+
+    a.n_ai_sentences,
+
+    LN(
+        1 + a.n_ai_sentences
+    ) AS log_ai_sentences,
+
+
+    /*==========================================================================
+      PAPER TYPE
+    ==========================================================================*/
+
+    o.title,
+
+    o.work_type,
+
+    CASE
+        WHEN LOWER(o.work_type) = 'article'
+            THEN TRUE
+        ELSE FALSE
+    END AS is_article,
+
+    CASE
+        WHEN LOWER(o.work_type) = 'review'
+            THEN TRUE
+        ELSE FALSE
+    END AS is_review,
+
+
+    /*==========================================================================
+      TEAM SIZE
+    ==========================================================================*/
+
+    o.authors_count,
+
+    o.authorships_truncated,
+
+    o.countries_distinct_count,
+
+    o.institutions_distinct_count,
+
+
+    /*--------------------------------------------------------------------------
+      Exact team-size category.
+
+      Prespecified categories:
+
+          1
+          2
+          3
+          4
+          5
+          6
+          7
+          8
+          9
+          10
+          11-19
+          20+
+
+      Exact categories 1-10 allow the "shrinking middle" hypothesis to be
+      tested without imposing the 4-6 grouping on the distribution.
+    --------------------------------------------------------------------------*/
+
+    CASE
+
+        WHEN o.authors_count = 1 THEN '1'
+
+        WHEN o.authors_count = 2 THEN '2'
+
+        WHEN o.authors_count = 3 THEN '3'
+
+        WHEN o.authors_count = 4 THEN '4'
+
+        WHEN o.authors_count = 5 THEN '5'
+
+        WHEN o.authors_count = 6 THEN '6'
+
+        WHEN o.authors_count = 7 THEN '7'
+
+        WHEN o.authors_count = 8 THEN '8'
+
+        WHEN o.authors_count = 9 THEN '9'
+
+        WHEN o.authors_count = 10 THEN '10'
+
+        WHEN o.authors_count BETWEEN 11 AND 19
+            THEN '11-19'
+
+        WHEN o.authors_count >= 20
+            THEN '20+'
+
+        ELSE NULL
+
+    END AS team_size_category,
+
+
+    /*--------------------------------------------------------------------------
+      Prespecified middle-team indicator.
+
+      The 4-6 author range was identified in the previous version of the study.
+      It is therefore treated as a prespecified confirmatory hypothesis in the
+      expanded analysis rather than a newly discovered bin.
+    --------------------------------------------------------------------------*/
+
+    CASE
+
+        WHEN o.authors_count BETWEEN 4 AND 6
+            THEN 1
+
+        WHEN o.authors_count IS NOT NULL
+            THEN 0
+
+        ELSE NULL
+
+    END AS team_middle_4_6,
+
+
+    /*==========================================================================
+      FIRST AUTHOR
+    ==========================================================================*/
+
+    (
+        SELECT ANY_VALUE(
+            au.author.id
+        )
+
+        FROM UNNEST(o.authorships) AS au
+
+        WHERE au.author_position = 'first'
+
+    ) AS first_author_id,
+
+
+    (
+        SELECT ANY_VALUE(
+            au.countries[SAFE_OFFSET(0)]
+        )
+
+        FROM UNNEST(o.authorships) AS au
+
+        WHERE au.author_position = 'first'
+
+    ) AS first_author_country,
+
+
+    (
+        SELECT ANY_VALUE(
+            au.institutions[SAFE_OFFSET(0)].id
+        )
+
+        FROM UNNEST(o.authorships) AS au
+
+        WHERE au.author_position = 'first'
+
+    ) AS first_author_institution_id,
+
+
+    /*==========================================================================
+      LAST AUTHOR
+    ==========================================================================*/
+
+    (
+        SELECT ANY_VALUE(
+            au.author.id
+        )
+
+        FROM UNNEST(o.authorships) AS au
+
+        WHERE au.author_position = 'last'
+
+    ) AS last_author_id,
+
+
+    (
+        SELECT ANY_VALUE(
+            au.countries[SAFE_OFFSET(0)]
+        )
+
+        FROM UNNEST(o.authorships) AS au
+
+        WHERE au.author_position = 'last'
+
+    ) AS last_author_country,
+
+
+    (
+        SELECT ANY_VALUE(
+            au.institutions[SAFE_OFFSET(0)].id
+        )
+
+        FROM UNNEST(o.authorships) AS au
+
+        WHERE au.author_position = 'last'
+
+    ) AS last_author_institution_id,
+
+
+    /*==========================================================================
+      CORRESPONDING AUTHOR
+    ==========================================================================*/
+
+    (
+        SELECT ANY_VALUE(
+            au.author.id
+        )
+
+        FROM UNNEST(o.authorships) AS au
+
+        WHERE au.is_corresponding = TRUE
+
+    ) AS corresponding_author_id,
+
+
+    (
+        SELECT ANY_VALUE(
+            au.countries[SAFE_OFFSET(0)]
+        )
+
+        FROM UNNEST(o.authorships) AS au
+
+        WHERE au.is_corresponding = TRUE
+
+    ) AS corresponding_author_country,
+
+
+    (
+        SELECT ANY_VALUE(
+            au.institutions[SAFE_OFFSET(0)].id
+        )
+
+        FROM UNNEST(o.authorships) AS au
+
+        WHERE au.is_corresponding = TRUE
+
+    ) AS corresponding_author_institution_id,
+
+
+    /*==========================================================================
+      AUTHOR ROLE COUNTS
+    ==========================================================================*/
+
+    (
+        SELECT COUNTIF(
+            au.is_corresponding = TRUE
+        )
+
+        FROM UNNEST(o.authorships) AS au
+
+    ) AS n_corresponding_authors,
+
+
+    (
+        SELECT COUNTIF(
+            au.author_position = 'first'
+            AND au.is_corresponding = TRUE
+        )
+
+        FROM UNNEST(o.authorships) AS au
+
+    ) AS n_first_corresponding,
+
+
+    (
+        SELECT COUNTIF(
+            au.author_position = 'last'
+            AND au.is_corresponding = TRUE
+        )
+
+        FROM UNNEST(o.authorships) AS au
+
+    ) AS n_last_corresponding,
+
+
+    /*==========================================================================
+      ANALYSIS-ELIGIBILITY FLAGS
+
+      These flags allow each analysis to use its appropriate denominator
+      without forcing all analyses onto the smallest common sample.
+    ==========================================================================*/
+
+
+    /*--------------------------------------------------------------------------
+      Complete team information.
+    --------------------------------------------------------------------------*/
+
+    CASE
+
+        WHEN o.authorships_truncated IS FALSE
+             AND o.authors_count IS NOT NULL
+            THEN TRUE
+
+        ELSE FALSE
+
+    END AS eligible_team_data,
+
+
+    /*--------------------------------------------------------------------------
+      First-author panel.
+    --------------------------------------------------------------------------*/
+
+    CASE
+
+        WHEN o.authorships_truncated IS FALSE
+             AND o.authors_count IS NOT NULL
+             AND EXISTS (
+                 SELECT 1
+                 FROM UNNEST(o.authorships) AS au
+                 WHERE au.author_position = 'first'
+                   AND au.author.id IS NOT NULL
+             )
+            THEN TRUE
+
+        ELSE FALSE
+
+    END AS eligible_first_author_data,
+
+
+    /*--------------------------------------------------------------------------
+      Last-author panel.
+    --------------------------------------------------------------------------*/
+
+    CASE
+
+        WHEN o.authorships_truncated IS FALSE
+             AND EXISTS (
+                 SELECT 1
+                 FROM UNNEST(o.authorships) AS au
+                 WHERE au.author_position = 'last'
+                   AND au.author.id IS NOT NULL
+             )
+            THEN TRUE
+
+        ELSE FALSE
+
+    END AS eligible_last_author_data,
+
+
+    /*--------------------------------------------------------------------------
+      Corresponding-author panel.
+    --------------------------------------------------------------------------*/
+
+    CASE
+
+        WHEN o.authorships_truncated IS FALSE
+             AND EXISTS (
+                 SELECT 1
+                 FROM UNNEST(o.authorships) AS au
+                 WHERE au.is_corresponding = TRUE
+                   AND au.author.id IS NOT NULL
+             )
+            THEN TRUE
+
+        ELSE FALSE
+
+    END AS eligible_corresponding_author_data,
+
+
+    /*==========================================================================
+      DISCIPLINARY CLASSIFICATION
+    ==========================================================================*/
+
+    o.topic_id,
+
+    o.topic_name,
+
+    o.subfield_id,
+
+    o.subfield_name,
+
+    o.field_id,
+
+    o.field_name,
+
+    o.domain_id,
+
+    o.domain_name,
+
+
+    /*==========================================================================
+      JOURNAL / SOURCE
+    ==========================================================================*/
+
+    o.source_id,
+
+    o.source_name,
+
+    o.source_is_core,
+
+    o.source_is_oa,
+
+
+    /*==========================================================================
+      REFERENCES / CITATIONS
+    ==========================================================================*/
+
+    o.referenced_works_count,
+
+    o.cited_by_count,
+
+    /*
+    Preserve the full OpenAlex reference array.
+
+    Do not UNNEST in M1.
+
+    It will later support:
+        M4 = focal x citing paper
+        D1 = focal x predecessor
+        D2 = focal citation summary
+    */
+
+    o.referenced_works,
+
+
+    /*==========================================================================
+      STATUS
+    ==========================================================================*/
+
+    o.is_retracted,
+
+    o.is_paratext,
+
+    o.is_xpac,
+
+    o.is_oa,
+
+
+    /*==========================================================================
+      IDENTIFIERS
+    ==========================================================================*/
+
+    o.doi,
+
+    o.ids
+
+
+FROM ai_source AS a
+
+INNER JOIN oa_source AS o
+    USING (openalex_id)
+
+
+/*==============================================================================
+M1 MASTER-UNIVERSE RESTRICTIONS
+==============================================================================*/
+
+WHERE
+
+    /*
+    Only article/review document types.
+
+    The AI-score source was originally constructed using these document types.
+    */
+    LOWER(o.work_type) IN ('article', 'review')
+
+
+    /*
+    Preserve the original >=3-reference inclusion criterion.
+    */
+    AND o.referenced_works_count >= 3
+
+
+    /*
+    Retracted works are outside the research universe.
+    */
+    AND o.is_retracted IS NOT TRUE
+
+
+    /*
+    Paratext is outside the research universe.
+    */
+    AND o.is_paratext IS NOT TRUE;
+
+
+/*==============================================================================
+SECTION 4. CORE QUALITY CONTROL
+==============================================================================*/
+
+
+/*------------------------------------------------------------------------------
+QC 4A. MASTER SAMPLE
+------------------------------------------------------------------------------*/
+
+SELECT
+
+    COUNT(*) AS n_papers,
+
+    COUNT(DISTINCT openalex_id)
+        AS n_unique_openalex,
+
+    COUNT(DISTINCT article_pmc)
+        AS n_unique_pmc,
+
+    MIN(accepted_date)
+        AS min_accepted_date,
+
+    MAX(accepted_date)
+        AS max_accepted_date
+
+FROM `redo.ai_papers_master`;
+
+
+/*------------------------------------------------------------------------------
+QC 4B. YEARLY SAMPLE / EXPOSURE / TEAM SIZE
+------------------------------------------------------------------------------*/
+
+SELECT
+
+    accepted_year,
+
+    COUNT(*) AS n_papers,
+
+    AVG(ai_score)
+        AS mean_ai,
+
+    APPROX_QUANTILES(
+        ai_score,
+        100
+    )[OFFSET(50)] AS median_ai,
+
+    APPROX_QUANTILES(
+        ai_score,
+        100
+    )[OFFSET(90)] AS p90_ai,
+
+    APPROX_QUANTILES(
+        ai_score,
+        100
+    )[OFFSET(95)] AS p95_ai,
+
+    AVG(
+        IF(
+            eligible_team_data,
+            authors_count,
+            NULL
+        )
+    ) AS mean_authors,
+
+    APPROX_QUANTILES(
+        IF(
+            eligible_team_data,
+            authors_count,
+            NULL
+        ),
+        100
+    )[OFFSET(50)] AS median_authors,
+
+    APPROX_QUANTILES(
+        IF(
+            eligible_team_data,
+            authors_count,
+            NULL
+        ),
+        100
+    )[OFFSET(90)] AS p90_authors,
+
+    APPROX_QUANTILES(
+        IF(
+            eligible_team_data,
+            authors_count,
+            NULL
+        ),
+        100
+    )[OFFSET(95)] AS p95_authors,
+
+    AVG(
+        IF(
+            eligible_team_data,
+            CAST(authors_count >= 20 AS INT64),
+            NULL
+        )
+    ) AS share_20plus
+
+FROM `redo.ai_papers_master`
+
+GROUP BY accepted_year
+
+ORDER BY accepted_year;
+
+
+/*------------------------------------------------------------------------------
+QC 4C. AI-ERA SAMPLE
+------------------------------------------------------------------------------*/
+
+SELECT
+
+    ai_era,
+
+    COUNT(*) AS n_papers,
+
+    MIN(accepted_date) AS first_accepted,
+
+    MAX(accepted_date) AS last_accepted,
+
+    AVG(ai_score) AS mean_ai,
+
+    APPROX_QUANTILES(
+        ai_score,
+        100
+    )[OFFSET(50)] AS median_ai,
+
+    APPROX_QUANTILES(
+        ai_score,
+        100
+    )[OFFSET(90)] AS p90_ai
+
+FROM `redo.ai_papers_master`
+
+GROUP BY ai_era
+
+ORDER BY
+
+    CASE ai_era
+        WHEN 'baseline' THEN 1
+        WHEN 'transition' THEN 2
+        WHEN 'post' THEN 3
+    END;
+
+
+/*------------------------------------------------------------------------------
+QC 4D. ANALYSIS-SPECIFIC ELIGIBILITY
+------------------------------------------------------------------------------*/
+
+SELECT
+
+    accepted_year,
+
+    COUNT(*) AS n_master,
+
+    COUNTIF(eligible_team_data)
+        AS n_team,
+
+    COUNTIF(eligible_first_author_data)
+        AS n_first_author,
+
+    COUNTIF(eligible_last_author_data)
+        AS n_last_author,
+
+    COUNTIF(eligible_corresponding_author_data)
+        AS n_corresponding_author,
+
+    COUNTIF(authorships_truncated IS TRUE)
+        AS n_truncated_authorship,
+
+    COUNTIF(publication_date_consistent)
+        AS n_publication_date_consistent,
+
+    COUNTIF(publication_before_acceptance)
+        AS n_publication_before_acceptance
+
+FROM `redo.ai_papers_master`
+
+GROUP BY accepted_year
+
+ORDER BY accepted_year;
+
+
+/*------------------------------------------------------------------------------
+QC 4E. EXACT TEAM-SIZE DISTRIBUTION BY YEAR
+
+This is the prespecified distribution used for the shrinking-middle analysis:
+
+    1
+    2
+    3
+    4
+    5
+    6
+    7
+    8
+    9
+    10
+    11-19
+    20+
+------------------------------------------------------------------------------*/
+
+SELECT
+
+    accepted_year,
+
+    team_size_category,
+
+    COUNT(*) AS n_papers
+
+FROM `redo.ai_papers_master`
+
+WHERE eligible_team_data
+
+GROUP BY
+    accepted_year,
+    team_size_category
+
+ORDER BY
+
+    accepted_year,
+
+    CASE team_size_category
+
+        WHEN '1' THEN 1
+        WHEN '2' THEN 2
+        WHEN '3' THEN 3
+        WHEN '4' THEN 4
+        WHEN '5' THEN 5
+        WHEN '6' THEN 6
+        WHEN '7' THEN 7
+        WHEN '8' THEN 8
+        WHEN '9' THEN 9
+        WHEN '10' THEN 10
+        WHEN '11-19' THEN 11
+        WHEN '20+' THEN 12
+
+    END;
+
+
+/*------------------------------------------------------------------------------
+QC 4F. QUARTERLY AI-SCORE DISTRIBUTION
+
+This is descriptive.
+
+Before the diffusion period, the score is interpreted as detector/background
+signal, NOT as historical AI use.
+------------------------------------------------------------------------------*/
+
+SELECT
+
+    accepted_quarter_date,
+
+    accepted_year_quarter,
+
+    ai_era,
+
+    COUNT(*) AS n_papers,
+
+    AVG(ai_score)
+        AS mean_ai,
+
+    APPROX_QUANTILES(
+        ai_score,
+        100
+    )[OFFSET(50)] AS median_ai,
+
+    APPROX_QUANTILES(
+        ai_score,
+        100
+    )[OFFSET(75)] AS p75_ai,
+
+    APPROX_QUANTILES(
+        ai_score,
+        100
+    )[OFFSET(90)] AS p90_ai,
+
+    APPROX_QUANTILES(
+        ai_score,
+        100
+    )[OFFSET(95)] AS p95_ai
+
+FROM `redo.ai_papers_master`
+
+GROUP BY
+
+    accepted_quarter_date,
+    accepted_year_quarter,
+    ai_era
+
+ORDER BY accepted_quarter_date;
+
+
+/*------------------------------------------------------------------------------
+QC 4G. DOCUMENT TYPE
+------------------------------------------------------------------------------*/
+
+SELECT
+
+    accepted_year,
+
+    work_type,
+
+    COUNT(*) AS n_papers
+
+FROM `redo.ai_papers_master`
+
+GROUP BY
+    accepted_year,
+    work_type
+
+ORDER BY
+    accepted_year,
+    work_type;
+
+
+/*------------------------------------------------------------------------------
+QC 4H. REFERENCE COVERAGE
+------------------------------------------------------------------------------*/
+
+SELECT
+
+    COUNT(*) AS n_papers,
+
+    MIN(referenced_works_count)
+        AS min_references,
+
+    APPROX_QUANTILES(
+        referenced_works_count,
+        100
+    )[OFFSET(50)] AS median_references,
+
+    APPROX_QUANTILES(
+        referenced_works_count,
+        100
+    )[OFFSET(90)] AS p90_references,
+
+    APPROX_QUANTILES(
+        referenced_works_count,
+        100
+    )[OFFSET(95)] AS p95_references,
+
+    MAX(referenced_works_count)
+        AS max_references
+
+FROM `redo.ai_papers_master`;
+
+
+/*------------------------------------------------------------------------------
+QC 4I. TOPIC / JOURNAL COVERAGE
+------------------------------------------------------------------------------*/
+
+SELECT
+
+    COUNT(*) AS n_papers,
+
+    COUNTIF(topic_id IS NULL)
+        AS missing_topic,
+
+    COUNTIF(subfield_id IS NULL)
+        AS missing_subfield,
+
+    COUNTIF(field_id IS NULL)
+        AS missing_field,
+
+    COUNTIF(domain_id IS NULL)
+        AS missing_domain,
+
+    COUNTIF(source_id IS NULL)
+        AS missing_source
+
+FROM `redo.ai_papers_master`;
+
+
+/*------------------------------------------------------------------------------
+QC 4J. AI SCORE / SENTENCE COUNT
+
+Measurement diagnostic only.
+
+Detailed sentence-count sensitivity analyses belong in SI rather than the
+main substantive analysis.
+------------------------------------------------------------------------------*/
+
+SELECT
+
+    COUNT(*) AS n_papers,
+
+    MIN(n_ai_sentences)
+        AS min_sentences,
+
+    APPROX_QUANTILES(
+        n_ai_sentences,
+        100
+    )[OFFSET(10)] AS p10_sentences,
+
+    APPROX_QUANTILES(
+        n_ai_sentences,
+        100
+    )[OFFSET(50)] AS median_sentences,
+
+    APPROX_QUANTILES(
+        n_ai_sentences,
+        100
+    )[OFFSET(90)] AS p90_sentences,
+
+    MAX(n_ai_sentences)
+        AS max_sentences,
+
+    MIN(ai_score)
+        AS min_ai,
+
+    MAX(ai_score)
+        AS max_ai
+
+FROM `redo.ai_papers_master`;
+
+
+/*------------------------------------------------------------------------------
+QC 4K. DUPLICATE CHECK
+------------------------------------------------------------------------------*/
+
+SELECT
+
+    openalex_id,
+
+    COUNT(*) AS n_rows
+
+FROM `redo.ai_papers_master`
+
+GROUP BY openalex_id
+
+HAVING COUNT(*) > 1
+
+ORDER BY n_rows DESC;
+
+
+/*==============================================================================
+SECTION 5. COMPACT ANALYSIS VIEW
+==============================================================================
+
+Purpose
+-------
+Provide a lightweight paper-level view for notebooks and routine queries.
+
+Large nested fields such as referenced_works remain in M1 but are omitted here.
+==============================================================================*/
+
+CREATE OR REPLACE VIEW `redo.ai_papers_analysis_core`
+AS
+
+SELECT
+
+    openalex_id,
+    article_pmc,
+
+    accepted_date,
+    accepted_year,
+    accepted_quarter,
+    accepted_month,
+    accepted_month_date,
+    accepted_quarter_date,
+    accepted_year_quarter,
+
+    ai_era,
+
+    publication_date,
+    publication_year,
+    accept_to_publish_days,
+    publication_date_consistent,
+    publication_before_acceptance,
+
+    ai_score,
+    n_ai_sentences,
+    log_ai_sentences,
+
+    work_type,
+    is_article,
+    is_review,
+
+    authors_count,
+    team_size_category,
+    team_middle_4_6,
+
+    countries_distinct_count,
+    institutions_distinct_count,
+
+    authorships_truncated,
+
+    first_author_id,
+    first_author_country,
+    first_author_institution_id,
+
+    last_author_id,
+    last_author_country,
+    last_author_institution_id,
+
+    corresponding_author_id,
+    corresponding_author_country,
+    corresponding_author_institution_id,
+
+    n_corresponding_authors,
+    n_first_corresponding,
+    n_last_corresponding,
+
+    eligible_team_data,
+    eligible_first_author_data,
+    eligible_last_author_data,
+    eligible_corresponding_author_data,
+
+    topic_id,
+    topic_name,
+
+    subfield_id,
+    subfield_name,
+
+    field_id,
+    field_name,
+
+    domain_id,
+    domain_name,
+
+    source_id,
+    source_name,
+    source_is_core,
+    source_is_oa,
+
+    referenced_works_count,
+    cited_by_count,
+
+    is_oa
+
+FROM `redo.ai_papers_master`;
+
+
+
