@@ -1,0 +1,776 @@
+/*==============================================================================
+M2. PAPER x AUTHOR
+FINAL CORRECTED AUTHORSHIP RECONSTRUCTION
+
+PURPOSE
+-------
+Create one row per OpenAlex paper x distinct OpenAlex author.
+
+WHY DEDUPLICATION IS NECESSARY
+------------------------------
+A small fraction of OpenAlex works contain repeated occurrences of the same
+author in the authorships array.
+
+Example observed in this dataset:
+
+    authors_count = 10
+    distinct authors = 10
+    raw authorship records = 110
+
+The same 10 authors were repeated 11 times.
+
+Therefore the analytical author unit is:
+
+    one paper x one distinct author
+
+ROLE RECONSTRUCTION
+-------------------
+For repeated author records:
+
+    is_first_author =
+        TRUE if ANY occurrence has author_position = 'first'
+
+    is_last_author =
+        TRUE if ANY occurrence has author_position = 'last'
+
+    is_corresponding_author =
+        TRUE if ANY occurrence has is_corresponding = TRUE
+
+COUNTRY / INSTITUTION
+---------------------
+We retain the country and institution arrays from the first raw occurrence
+of the author. In the observed pathological cases, repeated records are
+identical for these fields.
+
+COMPLETENESS
+------------
+Because authorships_truncated is NULL throughout this OpenAlex snapshot,
+complete authorship is defined empirically as:
+
+    distinct_author_count = authors_count
+
+This is an analysis-specific quality flag.
+
+==============================================================================*/
+
+
+/*==============================================================================
+1. EXPAND RAW OPENALEX AUTHORSHIPS
+==============================================================================*/
+
+CREATE TEMP TABLE m2_raw AS
+
+SELECT
+
+    /*==========================================================================
+      PAPER IDENTIFIERS
+    ==========================================================================*/
+
+    p.openalex_id,
+    p.article_pmc,
+
+
+    /*==========================================================================
+      PAPER TIMING
+    ==========================================================================*/
+
+    p.accepted_date,
+    p.accepted_year,
+    p.accepted_quarter,
+    p.accepted_month,
+
+    p.accepted_month_date,
+    p.accepted_quarter_date,
+    p.accepted_year_quarter,
+
+    p.ai_era,
+
+    p.publication_date,
+    p.publication_year,
+
+
+    /*==========================================================================
+      AI MEASURE
+    ==========================================================================*/
+
+    p.ai_score,
+    p.n_ai_sentences,
+    p.log_ai_sentences,
+
+
+    /*==========================================================================
+      PAPER CHARACTERISTICS
+    ==========================================================================*/
+
+    p.title,
+    p.work_type,
+    p.is_article,
+    p.is_review,
+
+    p.authors_count,
+    p.team_size_category,
+    p.team_middle_4_6,
+
+    p.authorships_truncated,
+
+
+    /*==========================================================================
+      DISCIPLINE
+    ==========================================================================*/
+
+    p.topic_id,
+    p.topic_name,
+
+    p.subfield_id,
+    p.subfield_name,
+
+    p.field_id,
+    p.field_name,
+
+    p.domain_id,
+    p.domain_name,
+
+
+    /*==========================================================================
+      JOURNAL
+    ==========================================================================*/
+
+    p.source_id,
+    p.source_name,
+
+
+    /*==========================================================================
+      REFERENCES
+    ==========================================================================*/
+
+    p.referenced_works_count,
+
+
+    /*==========================================================================
+      AUTHORSHIP ARRAY
+    ==========================================================================*/
+
+    author_offset AS raw_author_order_zero_based,
+
+    author_offset + 1 AS raw_author_rank,
+
+    REPLACE(
+        au.author.id,
+        'https://openalex.org/',
+        ''
+    ) AS author_id,
+
+    au.author_position,
+
+    COALESCE(
+        au.is_corresponding,
+        FALSE
+    ) AS is_corresponding,
+
+    au.countries AS author_countries,
+
+    au.institutions AS author_institutions
+
+FROM `redo.ai_papers_master` AS p
+
+INNER JOIN `subugoe-collaborative.openalex_walden.works` AS w
+
+    ON REPLACE(
+        w.id,
+        'https://openalex.org/',
+        ''
+    ) = p.openalex_id
+
+CROSS JOIN UNNEST(w.authorships) AS au
+
+WITH OFFSET AS author_offset
+
+WHERE
+    au.author.id IS NOT NULL;
+
+
+/*==============================================================================
+2. PAPER-LEVEL RAW AUTHORSHIP DIAGNOSTICS
+==============================================================================*/
+
+CREATE TEMP TABLE m2_paper_diagnostics AS
+
+SELECT
+
+    openalex_id,
+
+    ANY_VALUE(authors_count)
+        AS authors_count,
+
+    COUNT(*) AS raw_authorship_rows,
+
+    COUNT(DISTINCT author_id)
+        AS distinct_author_count,
+
+    COUNT(*) - COUNT(DISTINCT author_id)
+        AS duplicate_author_rows
+
+FROM m2_raw
+
+GROUP BY openalex_id;
+
+
+/*==============================================================================
+3. COLLAPSE TO ONE ROW PER PAPER x AUTHOR
+==============================================================================
+
+Important implementation detail:
+
+ARRAY_AGG of an ARRAY is not allowed in BigQuery.
+
+Therefore we aggregate the scalar/STRUCT record containing the arrays, then
+extract the selected record after aggregation.
+
+==============================================================================*/
+
+CREATE TEMP TABLE m2_authorship_clean AS
+
+SELECT
+
+    openalex_id,
+
+    author_id,
+
+
+    /*--------------------------------------------------------------------------
+      First raw position of this author.
+
+      For normal records this is the actual author position.
+
+      For repaired records it is retained only as a diagnostic.
+    --------------------------------------------------------------------------*/
+
+    MIN(
+        raw_author_order_zero_based
+    ) AS first_raw_author_order_zero_based,
+
+    MIN(
+        raw_author_rank
+    ) AS first_raw_author_rank,
+
+
+    /*--------------------------------------------------------------------------
+      Author roles.
+
+      Use ANY occurrence because pathological duplicated records may have
+      "middle" positions in repeated copies even when one occurrence correctly
+      identifies the first/last author.
+    --------------------------------------------------------------------------*/
+
+    LOGICAL_OR(
+        author_position = 'first'
+    ) AS is_first_author,
+
+    LOGICAL_OR(
+        author_position = 'last'
+    ) AS has_explicit_last_position,
+
+    LOGICAL_OR(
+        is_corresponding
+    ) AS is_corresponding_author,
+
+
+    /*--------------------------------------------------------------------------
+      Select the earliest raw occurrence as the representative record.
+
+      We aggregate a STRUCT rather than the array itself.
+    --------------------------------------------------------------------------*/
+
+    ARRAY_AGG(
+
+        STRUCT(
+            author_countries AS countries,
+            author_institutions AS institutions
+        )
+
+        ORDER BY raw_author_order_zero_based
+
+        LIMIT 1
+
+    )[SAFE_OFFSET(0)] AS representative_author_data,
+
+
+    /*--------------------------------------------------------------------------
+      Number of raw occurrences.
+    --------------------------------------------------------------------------*/
+
+    COUNT(*) AS raw_author_occurrences
+
+FROM m2_raw
+
+GROUP BY
+    openalex_id,
+    author_id;
+
+
+/*==============================================================================
+4. CREATE FINAL M2
+==============================================================================*/
+
+CREATE OR REPLACE TABLE `redo.ai_paper_authors`
+
+CLUSTER BY
+    author_id,
+    accepted_year,
+    subfield_id
+
+AS
+
+SELECT
+
+    /*==========================================================================
+      PAPER
+    ==========================================================================*/
+
+    p.openalex_id,
+    p.article_pmc,
+
+    p.accepted_date,
+    p.accepted_year,
+    p.accepted_quarter,
+    p.accepted_month,
+
+    p.accepted_month_date,
+    p.accepted_quarter_date,
+    p.accepted_year_quarter,
+
+    p.ai_era,
+
+    p.publication_date,
+    p.publication_year,
+
+    p.ai_score,
+    p.n_ai_sentences,
+    p.log_ai_sentences,
+
+    p.title,
+
+    p.work_type,
+    p.is_article,
+    p.is_review,
+
+    p.authors_count,
+
+    p.team_size_category,
+    p.team_middle_4_6,
+
+    p.authorships_truncated,
+
+
+    /*==========================================================================
+      DISCIPLINE
+    ==========================================================================*/
+
+    p.topic_id,
+    p.topic_name,
+
+    p.subfield_id,
+    p.subfield_name,
+
+    p.field_id,
+    p.field_name,
+
+    p.domain_id,
+    p.domain_name,
+
+
+    /*==========================================================================
+      JOURNAL
+    ==========================================================================*/
+
+    p.source_id,
+    p.source_name,
+
+
+    /*==========================================================================
+      REFERENCES
+    ==========================================================================*/
+
+    p.referenced_works_count,
+
+
+    /*==========================================================================
+      AUTHOR
+    ==========================================================================*/
+
+    a.author_id,
+
+    a.first_raw_author_order_zero_based,
+
+    a.first_raw_author_rank,
+
+
+    /*--------------------------------------------------------------------------
+      Representative country array
+    --------------------------------------------------------------------------*/
+
+    a.representative_author_data.countries
+        AS author_countries,
+
+    a.representative_author_data.countries[
+        SAFE_OFFSET(0)
+    ] AS primary_author_country,
+
+
+    /*--------------------------------------------------------------------------
+      Representative institution array
+    --------------------------------------------------------------------------*/
+
+    a.representative_author_data.institutions
+        AS author_institutions,
+
+    a.representative_author_data.institutions[
+        SAFE_OFFSET(0)
+    ].id AS primary_author_institution_id,
+
+    a.representative_author_data.institutions[
+        SAFE_OFFSET(0)
+    ].display_name AS primary_author_institution_name,
+
+
+    /*==========================================================================
+      AUTHOR ROLES
+    ==========================================================================*/
+
+    a.is_first_author,
+
+
+    CASE
+
+        WHEN a.has_explicit_last_position
+            THEN TRUE
+
+        WHEN p.authors_count = 1
+            THEN TRUE
+
+        ELSE FALSE
+
+    END AS is_last_author,
+
+
+    a.is_corresponding_author,
+
+
+    CASE
+
+        WHEN a.is_first_author
+             AND a.is_corresponding_author
+
+            THEN TRUE
+
+        ELSE FALSE
+
+    END AS is_first_corresponding,
+
+
+    CASE
+
+        WHEN (
+            a.has_explicit_last_position
+            OR p.authors_count = 1
+        )
+        AND a.is_corresponding_author
+
+            THEN TRUE
+
+        ELSE FALSE
+
+    END AS is_last_corresponding,
+
+
+    /*==========================================================================
+      DATA QUALITY
+    ==========================================================================*/
+
+    d.raw_authorship_rows,
+
+    d.distinct_author_count,
+
+    d.duplicate_author_rows,
+
+
+    CASE
+
+        WHEN d.duplicate_author_rows > 0
+            THEN TRUE
+
+        ELSE FALSE
+
+    END AS authorship_dedup_required,
+
+
+    /*
+    Empirical completeness rule.
+
+    Because authorships_truncated is not populated in this snapshot, use the
+    agreement between distinct OpenAlex author IDs and authors_count.
+    */
+
+    CASE
+
+        WHEN p.authors_count IS NOT NULL
+             AND d.distinct_author_count = p.authors_count
+
+            THEN TRUE
+
+        ELSE FALSE
+
+    END AS complete_authorship,
+
+
+    a.raw_author_occurrences,
+
+
+    /*==========================================================================
+      ANALYSIS-SPECIFIC ROLE ELIGIBILITY
+    ==========================================================================*/
+
+    CASE
+
+        WHEN p.authors_count IS NOT NULL
+             AND d.distinct_author_count = p.authors_count
+             AND a.is_first_author
+
+            THEN TRUE
+
+        ELSE FALSE
+
+    END AS eligible_first_author,
+
+
+    CASE
+
+        WHEN p.authors_count IS NOT NULL
+             AND d.distinct_author_count = p.authors_count
+             AND (
+                 a.has_explicit_last_position
+                 OR p.authors_count = 1
+             )
+
+            THEN TRUE
+
+        ELSE FALSE
+
+    END AS eligible_last_author,
+
+
+    CASE
+
+        WHEN p.authors_count IS NOT NULL
+             AND d.distinct_author_count = p.authors_count
+             AND a.is_corresponding_author
+
+            THEN TRUE
+
+        ELSE FALSE
+
+    END AS eligible_corresponding_author
+
+
+FROM `redo.ai_papers_master` AS p
+
+INNER JOIN m2_authorship_clean AS a
+
+    USING (openalex_id)
+
+INNER JOIN m2_paper_diagnostics AS d
+
+    USING (openalex_id);
+
+
+/*==============================================================================
+5. M2 QUALITY CONTROL
+==============================================================================*/
+
+
+/*------------------------------------------------------------------------------
+QC 5A. FUNDAMENTAL GRAIN
+
+Expected:
+
+    n_rows = n_unique_paper_author_pairs
+------------------------------------------------------------------------------*/
+
+SELECT
+
+    COUNT(*) AS n_rows,
+
+    COUNT(
+        DISTINCT CONCAT(
+            openalex_id,
+            '||',
+            author_id
+        )
+    ) AS n_unique_paper_author_pairs
+
+FROM `redo.ai_paper_authors`;
+
+
+/*------------------------------------------------------------------------------
+QC 5B. DUPLICATES
+
+Expected:
+    zero rows.
+------------------------------------------------------------------------------*/
+
+SELECT
+
+    openalex_id,
+
+    author_id,
+
+    COUNT(*) AS n
+
+FROM `redo.ai_paper_authors`
+
+GROUP BY
+    openalex_id,
+    author_id
+
+HAVING COUNT(*) > 1
+
+ORDER BY n DESC
+
+LIMIT 100;
+
+
+/*------------------------------------------------------------------------------
+QC 5C. COMPLETENESS BY YEAR
+------------------------------------------------------------------------------*/
+
+SELECT
+
+    accepted_year,
+
+    COUNT(DISTINCT openalex_id)
+        AS n_papers,
+
+    COUNT(DISTINCT IF(
+        complete_authorship,
+        openalex_id,
+        NULL
+    )) AS n_complete,
+
+    COUNT(DISTINCT IF(
+        NOT complete_authorship,
+        openalex_id,
+        NULL
+    )) AS n_incomplete,
+
+    COUNT(DISTINCT IF(
+        authorship_dedup_required,
+        openalex_id,
+        NULL
+    )) AS n_repaired
+
+FROM `redo.ai_paper_authors`
+
+GROUP BY accepted_year
+
+ORDER BY accepted_year;
+
+
+/*------------------------------------------------------------------------------
+QC 5D. AUTHORS COUNT AGREEMENT
+------------------------------------------------------------------------------*/
+
+SELECT
+
+    complete_authorship,
+
+    COUNT(DISTINCT openalex_id)
+        AS n_papers
+
+FROM `redo.ai_paper_authors`
+
+GROUP BY complete_authorship;
+
+
+/*------------------------------------------------------------------------------
+QC 5E. ROLE COVERAGE BY YEAR
+------------------------------------------------------------------------------*/
+
+SELECT
+
+    accepted_year,
+
+    COUNT(DISTINCT IF(
+        eligible_first_author,
+        openalex_id,
+        NULL
+    )) AS first_author_papers,
+
+    COUNT(DISTINCT IF(
+        eligible_last_author,
+        openalex_id,
+        NULL
+    )) AS last_author_papers,
+
+    COUNT(DISTINCT IF(
+        eligible_corresponding_author,
+        openalex_id,
+        NULL
+    )) AS corresponding_author_papers
+
+FROM `redo.ai_paper_authors`
+
+GROUP BY accepted_year
+
+ORDER BY accepted_year;
+
+
+/*------------------------------------------------------------------------------
+QC 5F. DUPLICATION RATE
+------------------------------------------------------------------------------*/
+
+SELECT
+
+    COUNT(DISTINCT IF(
+        authorship_dedup_required,
+        openalex_id,
+        NULL
+    )) AS papers_requiring_dedup,
+
+    COUNT(DISTINCT openalex_id)
+        AS all_papers,
+
+    SAFE_DIVIDE(
+
+        COUNT(DISTINCT IF(
+            authorship_dedup_required,
+            openalex_id,
+            NULL
+        )),
+
+        COUNT(DISTINCT openalex_id)
+
+    ) AS share_requiring_dedup
+
+FROM `redo.ai_paper_authors`;
+
+
+/*------------------------------------------------------------------------------
+QC 5G. SEVERITY OF AUTHORSHIP DUPLICATION
+------------------------------------------------------------------------------*/
+
+SELECT
+
+    duplicate_author_rows,
+
+    COUNT(DISTINCT openalex_id)
+        AS n_papers
+
+FROM `redo.ai_paper_authors`
+
+WHERE authorship_dedup_required
+
+GROUP BY duplicate_author_rows
+
+ORDER BY duplicate_author_rows;
+
+
