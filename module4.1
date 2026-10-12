@@ -1,0 +1,653 @@
+/*==============================================================================
+M4 — DIRECT DESCENDANT × PREDECESSOR REUSE PROBABILITY
+
+QUESTION
+--------
+Among papers that cite a focal paper, is a reference from the focal paper
+less likely to be cited again by that downstream paper when the focal paper
+has higher AI-writing intensity?
+
+UNIT
+----
+    focal paper p
+    × citing paper c
+    × predecessor reference r
+
+Outcome:
+    1 if c also cites r
+    0 otherwise
+
+
+==============================================================================*/
+
+
+/*==============================================================================
+SECTION 1
+FOCAL × DESCENDANT BASE
+
+Only complete 24-month descendant observations.
+
+We keep both:
+    all descendants
+    external descendants
+
+==============================================================================*/
+
+CREATE OR REPLACE TABLE `redo.m4_descendant_base_24m`
+CLUSTER BY
+    focal_openalex_id,
+    citing_openalex_id
+AS
+
+SELECT DISTINCT
+
+    focal_openalex_id,
+
+    citing_openalex_id,
+
+    focal_accepted_year,
+
+    focal_ai_score,
+
+    focal_subfield_id,
+
+    focal_field_id,
+
+    focal_domain_id,
+
+    focal_source_id,
+
+    focal_reference_count,
+
+    citation_lag_days,
+
+    any_shared_author,
+
+    citing_reference_count
+
+FROM `redo.m4_focal_descendant`
+
+WHERE
+
+    within_24m = TRUE;
+
+
+
+/*==============================================================================
+QC
+==============================================================================*/
+
+SELECT
+
+    COUNT(*) AS focal_descendant_pairs,
+
+    COUNT(
+        DISTINCT focal_openalex_id
+    ) AS focal_papers,
+
+    COUNT(
+        DISTINCT citing_openalex_id
+    ) AS citing_papers,
+
+    COUNTIF(
+        any_shared_author
+    ) AS pairs_with_author_overlap,
+
+    COUNTIF(
+        NOT any_shared_author
+    ) AS external_pairs
+
+FROM `redo.m4_descendant_base_24m`;
+
+
+
+/*==============================================================================
+SECTION 2
+FOCAL REFERENCE BASE
+
+Every focal paper × predecessor reference.
+
+We retain the raw reference universe because the direct probability question
+is about whether a focal paper's cited reference is recovered by a descendant.
+
+==============================================================================*/
+
+CREATE OR REPLACE TABLE `redo.m4_focal_reference_base_24m`
+CLUSTER BY
+    focal_openalex_id,
+    predecessor_openalex_id
+AS
+
+SELECT DISTINCT
+
+    focal_openalex_id,
+
+    predecessor_openalex_id,
+
+    predecessor_work_matched,
+
+    predecessor_temporally_valid,
+
+    predecessor_after_focal,
+
+    predecessor_age_years,
+
+    predecessor_log_prior_citations,
+
+    same_topic,
+
+    same_subfield,
+
+    same_field,
+
+    same_domain
+
+FROM `redo.m4_focal_reference`
+
+WHERE
+
+    predecessor_openalex_id IS NOT NULL;
+
+
+
+/*==============================================================================
+SECTION 3
+DENOMINATOR CONSTRUCTION
+
+Each row represents one:
+
+    focal paper
+    × citing paper
+    × focal-paper reference
+
+The outcome will be whether the citing paper also cites that predecessor.
+
+Because the reuse numerator is sparse, we construct the denominator separately
+and then attach a binary reuse indicator.
+
+==============================================================================*/
+
+CREATE OR REPLACE TABLE `redo.m4_descendant_reference_denominator_24m`
+CLUSTER BY
+    focal_openalex_id,
+    citing_openalex_id
+AS
+
+SELECT
+
+    d.focal_openalex_id,
+
+    d.citing_openalex_id,
+
+    d.focal_accepted_year,
+
+    d.focal_ai_score,
+
+    d.focal_subfield_id,
+
+    d.focal_field_id,
+
+    d.focal_domain_id,
+
+    d.focal_source_id,
+
+    d.citation_lag_days,
+
+    d.any_shared_author,
+
+    d.citing_reference_count,
+
+    r.predecessor_openalex_id,
+
+    r.predecessor_work_matched,
+
+    r.predecessor_temporally_valid,
+
+    r.predecessor_after_focal,
+
+    r.predecessor_age_years,
+
+    r.predecessor_log_prior_citations,
+
+    r.same_topic,
+
+    r.same_subfield,
+
+    r.same_field,
+
+    r.same_domain
+
+FROM `redo.m4_descendant_base_24m` AS d
+
+INNER JOIN `redo.m4_focal_reference_base_24m` AS r
+
+    ON d.focal_openalex_id =
+       r.focal_openalex_id;
+
+
+
+/*==============================================================================
+SECTION 4
+DIRECT REUSE INDICATOR
+
+The positive reuse edge table contains exactly the focal × predecessor ×
+descendant combinations for which reuse = 1.
+
+We only need a binary flag.
+
+==============================================================================*/
+
+CREATE OR REPLACE TABLE `redo.m4_descendant_reference_analysis_24m`
+CLUSTER BY
+    focal_openalex_id,
+    citing_openalex_id
+AS
+
+SELECT
+
+    d.*,
+
+    CASE
+
+        WHEN
+            e.focal_openalex_id IS NOT NULL
+
+        THEN 1
+
+        ELSE 0
+
+    END AS reference_reused
+
+
+FROM `redo.m4_descendant_reference_denominator_24m` AS d
+
+LEFT JOIN (
+
+    SELECT DISTINCT
+
+        focal_openalex_id,
+
+        citing_openalex_id,
+
+        predecessor_openalex_id
+
+    FROM `redo.m4_reuse_edge`
+
+    WHERE
+        within_24m = TRUE
+
+) AS e
+
+    ON d.focal_openalex_id =
+       e.focal_openalex_id
+
+    AND d.citing_openalex_id =
+        e.citing_openalex_id
+
+    AND d.predecessor_openalex_id =
+        e.predecessor_openalex_id;
+
+
+
+/*==============================================================================
+SECTION 5
+CRITICAL QC
+
+For every focal × descendant pair, the number of reuse-positive references
+cannot exceed the focal reference count.
+
+==============================================================================*/
+
+SELECT
+
+    COUNT(*) AS focal_descendant_reference_rows,
+
+    COUNT(
+        DISTINCT focal_openalex_id
+    ) AS focal_papers,
+
+    COUNT(
+        DISTINCT citing_openalex_id
+    ) AS citing_papers,
+
+    COUNTIF(
+        reference_reused = 1
+    ) AS reused_reference_rows,
+
+    COUNTIF(
+        reference_reused = 0
+    ) AS nonreused_reference_rows,
+
+    SAFE_DIVIDE(
+        COUNTIF(
+            reference_reused = 1
+        ),
+        COUNT(*)
+    ) AS overall_reference_reuse_rate,
+
+    COUNTIF(
+        predecessor_work_matched
+    ) AS rows_predecessor_matched,
+
+    COUNTIF(
+        predecessor_temporally_valid
+    ) AS rows_predecessor_temporally_valid
+
+FROM `redo.m4_descendant_reference_analysis_24m`;
+
+/*==============================================================================
+SECTION 6
+DIRECT DESCENDANT-LEVEL REFERENCE REUSE
+
+UNIT
+----
+focal paper p x citing paper c
+
+OUTCOME
+-------
+share of focal paper p's references that are also cited by descendant c.
+
+This is the compact version of the 1.98-billion-row reference-level outcome.
+
+==============================================================================*/
+
+
+CREATE OR REPLACE TABLE `redo.m4_direct_reuse_pair_24m`
+CLUSTER BY
+    focal_subfield_id,
+    focal_accepted_year
+AS
+
+WITH reuse_pair AS (
+
+    SELECT
+
+        focal_openalex_id,
+
+        citing_openalex_id,
+
+        COUNT(
+            DISTINCT predecessor_openalex_id
+        ) AS n_focal_references_reused
+
+    FROM `redo.m4_reuse_edge`
+
+    WHERE
+        within_24m = TRUE
+
+    GROUP BY
+        focal_openalex_id,
+        citing_openalex_id
+
+)
+
+SELECT
+
+    d.focal_openalex_id,
+
+    d.citing_openalex_id,
+
+    d.focal_accepted_year,
+
+    d.focal_ai_score,
+
+    d.focal_subfield_id,
+
+    d.focal_field_id,
+
+    d.focal_domain_id,
+
+    d.focal_source_id,
+
+    d.focal_reference_count,
+
+    d.citing_reference_count,
+
+    d.citation_lag_days,
+
+    d.any_shared_author,
+
+    d.shares_focal_first_author,
+
+    d.shares_focal_last_author,
+
+    d.shares_focal_corresponding_author,
+
+    COALESCE(
+        r.n_focal_references_reused,
+        0
+    ) AS n_focal_references_reused,
+
+    SAFE_DIVIDE(
+
+        COALESCE(
+            r.n_focal_references_reused,
+            0
+        ),
+
+        d.focal_reference_count
+
+    ) AS direct_reference_reuse_rate
+
+FROM `redo.m4_focal_descendant` AS d
+
+LEFT JOIN reuse_pair AS r
+
+    ON d.focal_openalex_id =
+       r.focal_openalex_id
+
+    AND d.citing_openalex_id =
+        r.citing_openalex_id
+
+WHERE
+
+    d.within_24m = TRUE
+
+    AND d.focal_reference_count >= 3;
+
+
+/*==============================================================================
+SECTION 6A
+QC
+==============================================================================*/
+
+SELECT
+
+    COUNT(*) AS focal_descendant_pairs,
+
+    COUNT(
+        DISTINCT focal_openalex_id
+    ) AS focal_papers,
+
+    COUNT(
+        DISTINCT citing_openalex_id
+    ) AS citing_papers,
+
+    SUM(
+        n_focal_references_reused
+    ) AS total_reuse_events,
+
+    SUM(
+        focal_reference_count
+    ) AS total_reference_opportunities,
+
+    SAFE_DIVIDE(
+
+        SUM(
+            n_focal_references_reused
+        ),
+
+        SUM(
+            focal_reference_count
+        )
+
+    ) AS opportunity_weighted_reuse_rate,
+
+    AVG(
+        direct_reference_reuse_rate
+    ) AS mean_pair_reuse_rate,
+
+    APPROX_QUANTILES(
+        direct_reference_reuse_rate,
+        100
+    )[OFFSET(50)] AS median_pair_reuse_rate,
+
+    COUNTIF(
+        n_focal_references_reused > 0
+    ) AS pairs_with_any_reuse,
+
+    SAFE_DIVIDE(
+
+        COUNTIF(
+            n_focal_references_reused > 0
+        ),
+
+        COUNT(*)
+
+    ) AS share_pairs_with_any_reuse,
+
+    COUNTIF(
+        NOT any_shared_author
+    ) AS external_pairs,
+
+    AVG(
+        IF(
+            NOT any_shared_author,
+            direct_reference_reuse_rate,
+            NULL
+        )
+    ) AS mean_external_pair_reuse_rate
+
+FROM `redo.m4_direct_reuse_pair_24m`;
+
+
+/*==============================================================================
+SECTION 7
+DIRECT REFERENCE-REUSE PROBABILITY BY FOCAL AI DECILE
+
+Descriptive only.
+
+This is now calculated from the compact focal x descendant table rather than
+the 1.98-billion-row reference-opportunity table.
+
+==============================================================================*/
+
+WITH deciles AS (
+
+    SELECT
+
+        *,
+
+        NTILE(10) OVER (
+            ORDER BY
+                focal_ai_score
+        ) AS ai_decile
+
+    FROM `redo.m4_direct_reuse_pair_24m`
+
+)
+
+SELECT
+
+    ai_decile,
+
+    COUNT(*) AS n_focal_descendant_pairs,
+
+    COUNT(
+        DISTINCT focal_openalex_id
+    ) AS n_focal_papers,
+
+    COUNT(
+        DISTINCT citing_openalex_id
+    ) AS n_citing_papers,
+
+    AVG(
+        focal_ai_score
+    ) AS mean_ai_score,
+
+    AVG(
+        direct_reference_reuse_rate
+    ) AS mean_reference_reuse_rate,
+
+    AVG(
+        IF(
+            NOT any_shared_author,
+            direct_reference_reuse_rate,
+            NULL
+        )
+    ) AS mean_external_reference_reuse_rate
+
+FROM deciles
+
+GROUP BY
+    ai_decile
+
+ORDER BY
+    ai_decile;
+
+
+/*==============================================================================
+SECTION 8
+DIRECT REUSE BY FOCAL AI BIN
+
+A simpler descriptive table using the same compact outcome.
+
+==============================================================================*/
+
+SELECT
+
+    CASE
+
+        WHEN focal_ai_score = 0
+            THEN '0'
+
+        WHEN focal_ai_score < 0.10
+            THEN '0.01-0.09'
+
+        WHEN focal_ai_score < 0.20
+            THEN '0.10-0.19'
+
+        WHEN focal_ai_score < 0.40
+            THEN '0.20-0.39'
+
+        WHEN focal_ai_score < 0.60
+            THEN '0.40-0.59'
+
+        WHEN focal_ai_score < 0.80
+            THEN '0.60-0.79'
+
+        ELSE '0.80-1.00'
+
+    END AS ai_bin,
+
+    COUNT(*) AS n_focal_descendant_pairs,
+
+    COUNT(
+        DISTINCT focal_openalex_id
+    ) AS n_focal_papers,
+
+    AVG(
+        focal_ai_score
+    ) AS mean_ai_score,
+
+    AVG(
+        direct_reference_reuse_rate
+    ) AS mean_reference_reuse_rate,
+
+    AVG(
+        IF(
+            NOT any_shared_author,
+            direct_reference_reuse_rate,
+            NULL
+        )
+    ) AS mean_external_reference_reuse_rate
+
+FROM `redo.m4_direct_reuse_pair_24m`
+
+GROUP BY
+    ai_bin
+
+ORDER BY
+    MIN(
+        focal_ai_score
+    );
