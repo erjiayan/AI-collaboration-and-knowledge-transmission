@@ -651,3 +651,173 @@ ORDER BY
     MIN(
         focal_ai_score
     );
+
+CREATE OR REPLACE TABLE `redo.m4_direct_reuse_author_24m`
+CLUSTER BY
+    focal_accepted_year,
+    focal_subfield_id
+AS
+
+SELECT
+
+    focal_openalex_id,
+
+    ANY_VALUE(
+        focal_accepted_year
+    ) AS focal_accepted_year,
+
+    ANY_VALUE(
+        focal_ai_score
+    ) AS focal_ai_score,
+
+    ANY_VALUE(
+        focal_subfield_id
+    ) AS focal_subfield_id,
+
+    ANY_VALUE(
+        focal_field_id
+    ) AS focal_field_id,
+
+    ANY_VALUE(
+        focal_domain_id
+    ) AS focal_domain_id,
+
+    ANY_VALUE(
+        focal_source_id
+    ) AS focal_source_id,
+
+    ANY_VALUE(
+        focal_reference_count
+    ) AS focal_reference_count,
+
+
+    /*--------------------------------------------------------------------------
+      DESCENDANT-PAIR COUNT
+    --------------------------------------------------------------------------*/
+
+    COUNT(*) AS n_descendant_pairs,
+
+
+    /*--------------------------------------------------------------------------
+      DIRECT REFERENCE REUSE
+    --------------------------------------------------------------------------*/
+
+    AVG(
+        direct_reference_reuse_rate
+    ) AS mean_pair_reuse_rate,
+
+
+    /*--------------------------------------------------------------------------
+      EXTERNAL DESCENDANTS ONLY
+    --------------------------------------------------------------------------*/
+
+    COUNTIF(
+        NOT any_shared_author
+    ) AS n_external_descendant_pairs,
+
+    AVG(
+        IF(
+            NOT any_shared_author,
+            direct_reference_reuse_rate,
+            NULL
+        )
+    ) AS mean_external_pair_reuse_rate,
+
+
+    /*--------------------------------------------------------------------------
+      BASIC DESCENDANT CHARACTERISTICS
+    --------------------------------------------------------------------------*/
+
+    AVG(
+        citing_reference_count
+    ) AS mean_citing_reference_count,
+
+    AVG(
+        citation_lag_days
+    ) AS mean_citation_lag_days,
+
+
+    /*--------------------------------------------------------------------------
+      ANY-REUSE RATE
+    --------------------------------------------------------------------------*/
+
+    SAFE_DIVIDE(
+
+        COUNTIF(
+            n_focal_references_reused > 0
+        ),
+
+        COUNT(*)
+
+    ) AS share_descendants_with_any_reuse,
+
+
+    SAFE_DIVIDE(
+
+        COUNTIF(
+            NOT any_shared_author
+            AND n_focal_references_reused > 0
+        ),
+
+        COUNTIF(
+            NOT any_shared_author
+        )
+
+    ) AS share_external_descendants_with_any_reuse
+
+
+FROM `redo.m4_direct_reuse_pair_24m`
+
+GROUP BY
+    focal_openalex_id;
+
+
+/*==============================================================================
+QC
+==============================================================================*/
+
+SELECT
+
+    COUNT(*) AS focal_papers,
+
+    SUM(
+        n_descendant_pairs
+    ) AS total_descendant_pairs,
+
+    AVG(
+        mean_pair_reuse_rate
+    ) AS mean_focal_pair_reuse_rate,
+
+    SAFE_DIVIDE(
+
+        SUM(
+            mean_pair_reuse_rate
+            *
+            n_descendant_pairs
+        ),
+
+        SUM(
+            n_descendant_pairs
+        )
+
+    ) AS pair_weighted_reuse_rate,
+
+    AVG(
+        mean_external_pair_reuse_rate
+    ) AS mean_focal_external_pair_reuse_rate,
+
+    SAFE_DIVIDE(
+
+        SUM(
+            mean_external_pair_reuse_rate
+            *
+            n_external_descendant_pairs
+        ),
+
+        SUM(
+            n_external_descendant_pairs
+        )
+
+    ) AS external_pair_weighted_reuse_rate
+
+FROM `redo.m4_direct_reuse_author_24m`;
