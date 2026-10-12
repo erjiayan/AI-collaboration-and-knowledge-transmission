@@ -1,0 +1,5667 @@
+/*==============================================================================
+M4 — KNOWLEDGE RETENTION / CITATION-LINEAGE MASTER
+==============================================================================
+
+VERSION
+-------
+M4 final architecture, designed for:
+
+    - knowledge-retention analysis
+    - citation-opportunity adjustment
+    - reference-composition adjustment
+    - self/team-citation robustness
+    - 12/24/36-month windows
+    - later event-study / heterogeneity analyses
+
+CORE CONCEPT
+------------
+
+Focal paper p:
+    references(p) = R_p
+
+Descendant c:
+    c cites p
+
+Predecessor r:
+    r ∈ R_p
+
+Knowledge retention occurs when:
+
+    r ∈ references(c)
+
+Thus:
+
+    r -> p -> c
+    r -> c
+
+PRIMARY OUTCOME
+---------------
+
+Retention breadth:
+
+    number of focal references reused by descendants
+    ------------------------------------------------
+              total focal reference count
+
+We preserve:
+
+    ALL descendants
+
+and
+
+    EXTERNAL descendants
+    = descendants sharing no author with focal paper
+
+IMPORTANT DATE RULE
+-------------------
+
+citation_start_date =
+    MAX(accepted_date, valid OpenAlex publication date)
+
+If the OpenAlex publication date is unavailable/invalid:
+
+    citation_start_date = accepted_date
+
+OpenAlex snapshot date:
+    2026-06-26
+
+Citation windows:
+    12 months
+    24 months
+    36 months
+
+IMPORTANT SAMPLE RULE
+---------------------
+
+The original paper corpus requires >=3 references.
+
+M4 retains all focal papers, but creates:
+
+    retention_eligible_3plus_refs
+
+so the primary downstream retention analysis can enforce the original
+3-reference requirement explicitly.
+
+IMPORTANT IDENTIFICATION / CONTROLS
+-----------------------------------
+
+M4 retains, among other things:
+
+    reference count
+    reference age
+    reference disciplinary alignment
+    reference diversity / entropy
+    predecessor prior citations before focal year
+    focal team size
+    focal paper type
+    focal field / subfield / topic
+    focal journal/source
+    author career stage
+    prior productivity
+    baseline team profile
+    descendant count
+    external-descendant count
+    author overlap
+    descendant discipline
+    citation lag
+
+Current/future OpenAlex cited_by_count is NOT used as a baseline impact
+control because it is future-contaminated.
+
+==============================================================================*/
+
+
+/*==============================================================================
+SECTION 0
+FOCAL-PAPER WORK RECORD
+
+We extract the OpenAlex work record for focal papers once.
+
+The works table is partitioned by publication_year, so this uses the
+2010-2025 partitions for the focal corpus.
+
+OpenAlex IDs are normalized to W######## format so that they can match
+the M1-M3 identifiers and the IDs contained in referenced_works.
+==============================================================================*/
+
+CREATE OR REPLACE TABLE `redo.m4_focal_work`
+CLUSTER BY
+    accepted_year,
+    subfield_id,
+    source_id
+AS
+
+WITH focal AS (
+
+    SELECT DISTINCT
+
+        openalex_id,
+
+        article_pmc,
+
+        author_id AS focal_first_author_id,
+
+        accepted_date,
+
+        accepted_year,
+
+        accepted_quarter,
+
+        accepted_month,
+
+        accepted_month_date,
+
+        ai_era,
+
+        ai_score,
+
+        n_ai_sentences,
+
+        log_ai_sentences,
+
+        authors_count,
+
+        team_size_category,
+
+        work_type,
+
+        is_article,
+
+        is_review,
+
+        topic_id,
+
+        subfield_id,
+
+        field_id,
+
+        domain_id,
+
+        source_id,
+
+        source_name,
+
+        career_stage,
+
+        approximate_career_age,
+
+        career_start_unobserved_by_focal_year,
+
+        career_age_over_70,
+
+        openalex_prior_article_review_count,
+
+        prior_productivity_bin,
+
+        prior_corpus_papers,
+
+        prior_mean_team_size,
+
+        baseline_mean_team_size,
+
+        baseline_modal_team_regime,
+
+        authorship_dedup_required,
+
+        all_authors_resolved,
+
+        has_baseline_and_post_paper
+
+    FROM `redo.ai_author_history`
+
+    WHERE
+
+        is_first_author = TRUE
+
+        AND accepted_date BETWEEN
+            DATE '2010-01-01'
+            AND DATE '2025-12-31'
+
+),
+
+works_clean AS (
+
+    SELECT
+
+        REGEXP_EXTRACT(
+            id,
+            r'(W[0-9]+)$'
+        ) AS normalized_openalex_id,
+
+        id AS openalex_id_raw,
+
+        publication_date,
+
+        publication_year,
+
+        type,
+
+        authors_count AS openalex_authors_count,
+
+        authorships,
+
+        corresponding_author_ids,
+
+        referenced_works,
+
+        referenced_works_count,
+
+        primary_topic,
+
+        primary_location,
+
+        counts_by_year
+
+    FROM `subugoe-collaborative.openalex_walden.works`
+
+    WHERE
+
+        /*
+        Exploit partitioning.
+
+        A focal paper is accepted 2010-2025. We use 2010-2025 OpenAlex
+        publication partitions for the primary focal-work extraction.
+
+        Papers with anomalous OpenAlex publication years outside this range
+        can still remain in M4 through the accepted date if no OpenAlex work
+        match is found; their publication-date variable will then be missing.
+        */
+
+        publication_year BETWEEN
+            2010 AND 2025
+
+)
+
+SELECT
+
+    f.*,
+
+
+    /*--------------------------------------------------------------------------
+      OpenAlex work ID
+    --------------------------------------------------------------------------*/
+
+    w.openalex_id_raw,
+
+
+    /*--------------------------------------------------------------------------
+      Publication date
+
+      Raw + parsed versions retained.
+    --------------------------------------------------------------------------*/
+
+    w.publication_date AS publication_date_raw,
+
+    SAFE_CAST(
+        NULLIF(
+            TRIM(
+                w.publication_date
+            ),
+            ''
+        )
+        AS DATE
+    ) AS publication_date_parsed,
+
+    w.publication_year,
+
+
+    /*--------------------------------------------------------------------------
+      Publication-date validity
+
+      OpenAlex snapshot ends 2026-06-26.
+
+      Dates later than the snapshot are treated as anomalous for the purpose
+      of defining the citation clock.
+    --------------------------------------------------------------------------*/
+
+    CASE
+
+        WHEN
+            SAFE_CAST(
+                NULLIF(
+                    TRIM(
+                        w.publication_date
+                    ),
+                    ''
+                )
+                AS DATE
+            ) IS NULL
+
+            THEN FALSE
+
+        WHEN
+            SAFE_CAST(
+                NULLIF(
+                    TRIM(
+                        w.publication_date
+                    ),
+                    ''
+                )
+                AS DATE
+            ) <
+            DATE '1800-01-01'
+
+            THEN FALSE
+
+        WHEN
+            SAFE_CAST(
+                NULLIF(
+                    TRIM(
+                        w.publication_date
+                    ),
+                    ''
+                )
+                AS DATE
+            ) >
+            DATE '2026-06-26'
+
+            THEN FALSE
+
+        ELSE TRUE
+
+    END AS publication_date_valid,
+
+
+    /*--------------------------------------------------------------------------
+      Publication relative to acceptance
+    --------------------------------------------------------------------------*/
+
+    CASE
+
+        WHEN
+            SAFE_CAST(
+                NULLIF(
+                    TRIM(
+                        w.publication_date
+                    ),
+                    ''
+                )
+                AS DATE
+            ) >
+            f.accepted_date
+
+            THEN TRUE
+
+        ELSE FALSE
+
+    END AS publication_after_acceptance,
+
+
+    /*--------------------------------------------------------------------------
+      Raw OpenAlex work information
+    --------------------------------------------------------------------------*/
+
+    w.type AS openalex_work_type,
+
+    w.openalex_authors_count,
+
+    w.authorships,
+
+    w.corresponding_author_ids,
+
+    w.referenced_works,
+
+    COALESCE(
+        w.referenced_works_count,
+        ARRAY_LENGTH(
+            w.referenced_works
+        ),
+        0
+    ) AS reference_count,
+
+    w.primary_topic.id
+        AS openalex_topic_id,
+
+    w.primary_topic.subfield.id
+        AS openalex_subfield_id,
+
+    w.primary_topic.field.id
+        AS openalex_field_id,
+
+    w.primary_topic.domain.id
+        AS openalex_domain_id,
+
+    w.primary_location.source.id
+        AS openalex_source_id,
+
+    w.primary_location.source.display_name
+        AS openalex_source_name,
+
+    w.primary_location.source.is_core
+        AS openalex_source_is_core,
+
+    w.primary_location.source.is_oa
+        AS openalex_source_is_oa,
+
+    w.primary_location.source.type
+        AS openalex_source_type,
+
+
+    /*--------------------------------------------------------------------------
+      Snapshot citation history
+
+      Retained raw for predecessor-impact reconstruction.
+    --------------------------------------------------------------------------*/
+
+    w.counts_by_year
+
+FROM focal AS f
+
+LEFT JOIN works_clean AS w
+
+    ON f.openalex_id =
+       w.normalized_openalex_id;
+
+
+/*==============================================================================
+SECTION 1
+AUTHOR SET FOR FOCAL PAPERS
+
+This prevents another future scan of OpenAlex works when identifying
+self/team descendants.
+
+==============================================================================*/
+
+CREATE OR REPLACE TABLE `redo.m4_focal_author_set`
+CLUSTER BY
+    focal_openalex_id
+AS
+
+SELECT
+
+    openalex_id AS focal_openalex_id,
+
+    ARRAY(
+        SELECT DISTINCT
+            a.author.id
+        FROM UNNEST(
+            authorships
+        ) AS a
+        WHERE
+            a.author.id IS NOT NULL
+    ) AS focal_author_ids,
+
+
+    ARRAY(
+        SELECT DISTINCT
+            a.author.id
+        FROM UNNEST(
+            authorships
+        ) AS a
+        WHERE
+            a.author.id IS NOT NULL
+            AND a.author_position = 'first'
+    ) AS focal_first_author_ids,
+
+
+    ARRAY(
+        SELECT DISTINCT
+            a.author.id
+        FROM UNNEST(
+            authorships
+        ) AS a
+        WHERE
+            a.author.id IS NOT NULL
+            AND a.author_position = 'last'
+    ) AS focal_last_author_ids,
+
+
+    corresponding_author_ids
+        AS focal_corresponding_author_ids
+
+FROM `redo.m4_focal_work`
+WHERE
+    openalex_id_raw IS NOT NULL;
+
+
+/*==============================================================================
+SECTION 2
+FINAL FOCAL PAPER TABLE
+
+Adds citation clock and exact follow-up eligibility.
+
+==============================================================================*/
+
+CREATE OR REPLACE TABLE `redo.m4_focal`
+CLUSTER BY
+    accepted_year,
+    subfield_id,
+    source_id
+AS
+
+SELECT
+
+    f.*,
+
+
+    /*--------------------------------------------------------------------------
+      Citation start
+    --------------------------------------------------------------------------*/
+
+    CASE
+
+        WHEN
+            f.publication_date_valid = FALSE
+
+            THEN f.accepted_date
+
+        WHEN
+            f.accepted_date >=
+            f.publication_date_parsed
+
+            THEN f.accepted_date
+
+        ELSE
+            f.publication_date_parsed
+
+    END AS citation_start_date,
+
+
+    CASE
+
+        WHEN
+            f.publication_date_valid = FALSE
+
+            THEN 'accepted_date'
+
+        WHEN
+            f.accepted_date >=
+            f.publication_date_parsed
+
+            THEN 'accepted_date'
+
+        ELSE
+            'publication_date'
+
+    END AS citation_start_source,
+
+
+    /*--------------------------------------------------------------------------
+      Fixed follow-up endpoints
+    --------------------------------------------------------------------------*/
+
+    DATE_ADD(
+        CASE
+
+            WHEN
+                f.publication_date_valid = FALSE
+
+                THEN f.accepted_date
+
+            WHEN
+                f.accepted_date >=
+                f.publication_date_parsed
+
+                THEN f.accepted_date
+
+            ELSE
+                f.publication_date_parsed
+
+        END,
+        INTERVAL 12 MONTH
+    ) AS followup_12m_date,
+
+
+    DATE_ADD(
+        CASE
+
+            WHEN
+                f.publication_date_valid = FALSE
+
+                THEN f.accepted_date
+
+            WHEN
+                f.accepted_date >=
+                f.publication_date_parsed
+
+                THEN f.accepted_date
+
+            ELSE
+                f.publication_date_parsed
+
+        END,
+        INTERVAL 24 MONTH
+    ) AS followup_24m_date,
+
+
+    DATE_ADD(
+        CASE
+
+            WHEN
+                f.publication_date_valid = FALSE
+
+                THEN f.accepted_date
+
+            WHEN
+                f.accepted_date >=
+                f.publication_date_parsed
+
+                THEN f.accepted_date
+
+            ELSE
+                f.publication_date_parsed
+
+        END,
+        INTERVAL 36 MONTH
+    ) AS followup_36m_date,
+
+
+    /*--------------------------------------------------------------------------
+      Follow-up eligibility against actual OpenAlex snapshot date
+    --------------------------------------------------------------------------*/
+
+    (
+        DATE '2026-06-26'
+        >=
+        DATE_ADD(
+            CASE
+
+                WHEN
+                    f.publication_date_valid = FALSE
+
+                    THEN f.accepted_date
+
+                WHEN
+                    f.accepted_date >=
+                    f.publication_date_parsed
+
+                    THEN f.accepted_date
+
+                ELSE
+                    f.publication_date_parsed
+
+            END,
+            INTERVAL 12 MONTH
+        )
+    ) AS eligible_12m,
+
+
+    (
+        DATE '2026-06-26'
+        >=
+        DATE_ADD(
+            CASE
+
+                WHEN
+                    f.publication_date_valid = FALSE
+
+                    THEN f.accepted_date
+
+                WHEN
+                    f.accepted_date >=
+                    f.publication_date_parsed
+
+                    THEN f.accepted_date
+
+                ELSE
+                    f.publication_date_parsed
+
+            END,
+            INTERVAL 24 MONTH
+        )
+    ) AS eligible_24m,
+
+
+    (
+        DATE '2026-06-26'
+        >=
+        DATE_ADD(
+            CASE
+
+                WHEN
+                    f.publication_date_valid = FALSE
+
+                    THEN f.accepted_date
+
+                WHEN
+                    f.accepted_date >=
+                    f.publication_date_parsed
+
+                    THEN f.accepted_date
+
+                ELSE
+                    f.publication_date_parsed
+
+            END,
+            INTERVAL 36 MONTH
+        )
+    ) AS eligible_36m,
+
+
+    /*--------------------------------------------------------------------------
+      Original study reference requirement
+    --------------------------------------------------------------------------*/
+
+    (
+        f.reference_count >= 3
+    ) AS retention_eligible_3plus_refs,
+
+
+    /*--------------------------------------------------------------------------
+      Primary first-author paper indicator
+    --------------------------------------------------------------------------*/
+
+    TRUE AS is_first_author_focal
+
+FROM `redo.m4_focal_work` AS f;
+
+
+/*==============================================================================
+SECTION 3
+FOCAL PAPER DATE / COVERAGE QC
+==============================================================================*/
+
+SELECT
+
+    COUNT(*) AS n_focal_papers,
+
+    COUNT(
+        DISTINCT openalex_id
+    ) AS n_unique_focal_ids,
+
+    COUNTIF(
+        openalex_id_raw IS NULL
+    ) AS no_openalex_work_match,
+
+    COUNTIF(
+        publication_date_valid
+    ) AS valid_publication_dates,
+
+    COUNTIF(
+        NOT publication_date_valid
+    ) AS missing_or_invalid_publication_dates,
+
+    COUNTIF(
+        publication_after_acceptance
+    ) AS publication_after_acceptance,
+
+    COUNTIF(
+        citation_start_source = 'accepted_date'
+    ) AS citation_start_from_acceptance,
+
+    COUNTIF(
+        citation_start_source = 'publication_date'
+    ) AS citation_start_from_publication,
+
+    COUNTIF(
+        reference_count >= 3
+    ) AS reference_eligible_3plus,
+
+    COUNTIF(
+        eligible_12m
+    ) AS eligible_12m,
+
+    COUNTIF(
+        eligible_24m
+    ) AS eligible_24m,
+
+    COUNTIF(
+        eligible_36m
+    ) AS eligible_36m,
+
+    MIN(
+        citation_start_date
+    ) AS min_citation_start_date,
+
+    MAX(
+        citation_start_date
+    ) AS max_citation_start_date
+
+FROM `redo.m4_focal`;
+
+
+/*==============================================================================
+SECTION 4
+FOCAL-REFERENCE MASTER
+==============================================================================
+
+One row per:
+
+    focal paper x predecessor
+
+2025 focal papers remain in the data.
+
+We preserve:
+    - predecessor publication date
+    - predecessor age
+    - predecessor topic hierarchy
+    - focal/predecessor disciplinary relationship
+    - predecessor source
+    - predecessor citation history
+    - prior citations before focal year
+
+IMPORTANT
+---------
+Current OpenAlex cited_by_count is NOT used as a baseline control because it
+contains citations accumulated after the focal paper.
+
+Predecessor prominence is instead approximated from counts_by_year using
+citation counts in years strictly before the focal accepted year.
+
+==============================================================================*/
+
+
+CREATE OR REPLACE TABLE `redo.m4_focal_reference`
+CLUSTER BY
+    focal_openalex_id,
+    predecessor_openalex_id
+AS
+
+SELECT
+
+    /*--------------------------------------------------------------------------
+      FOCAL PAPER
+    --------------------------------------------------------------------------*/
+
+    f.openalex_id
+        AS focal_openalex_id,
+
+    f.focal_first_author_id,
+
+    f.accepted_date
+        AS focal_accepted_date,
+
+    f.citation_start_date
+        AS focal_citation_start_date,
+
+    f.accepted_year
+        AS focal_accepted_year,
+
+    f.ai_score
+        AS focal_ai_score,
+
+    f.authors_count
+        AS focal_authors_count,
+
+    f.reference_count
+        AS focal_reference_count,
+
+    f.work_type
+        AS focal_work_type,
+
+    f.topic_id
+        AS focal_topic_id,
+
+    f.subfield_id
+        AS focal_subfield_id,
+
+    f.field_id
+        AS focal_field_id,
+
+    f.domain_id
+        AS focal_domain_id,
+
+    f.source_id
+        AS focal_source_id,
+
+
+    /*--------------------------------------------------------------------------
+      PREDECESSOR ID
+    --------------------------------------------------------------------------*/
+
+    REGEXP_EXTRACT(
+        r,
+        r'(W[0-9]+)$'
+    ) AS predecessor_openalex_id,
+
+
+    /*--------------------------------------------------------------------------
+      PREDECESSOR MATCH
+    --------------------------------------------------------------------------*/
+
+    p.id
+        AS predecessor_openalex_id_raw,
+
+
+    CASE
+        WHEN p.id IS NOT NULL
+        THEN TRUE
+        ELSE FALSE
+    END AS predecessor_work_matched,
+
+
+    /*--------------------------------------------------------------------------
+      PREDECESSOR PUBLICATION DATE
+    --------------------------------------------------------------------------*/
+
+    p.publication_date
+        AS predecessor_publication_date_raw,
+
+    SAFE_CAST(
+        NULLIF(
+            TRIM(
+                p.publication_date
+            ),
+            ''
+        )
+        AS DATE
+    ) AS predecessor_publication_date,
+
+    p.publication_year
+        AS predecessor_publication_year,
+
+
+    /*--------------------------------------------------------------------------
+      PREDECESSOR DATE VALIDITY
+    --------------------------------------------------------------------------*/
+
+    CASE
+
+        WHEN
+            SAFE_CAST(
+                NULLIF(
+                    TRIM(
+                        p.publication_date
+                    ),
+                    ''
+                )
+                AS DATE
+            ) IS NULL
+
+            THEN FALSE
+
+        WHEN
+            SAFE_CAST(
+                NULLIF(
+                    TRIM(
+                        p.publication_date
+                    ),
+                    ''
+                )
+                AS DATE
+            ) <
+            DATE '1800-01-01'
+
+            THEN FALSE
+
+        WHEN
+            SAFE_CAST(
+                NULLIF(
+                    TRIM(
+                        p.publication_date
+                    ),
+                    ''
+                )
+                AS DATE
+            ) >
+            DATE '2026-06-26'
+
+            THEN FALSE
+
+        ELSE TRUE
+
+    END AS predecessor_date_valid,
+
+
+    /*--------------------------------------------------------------------------
+      PREDECESSOR WORK TYPE
+    --------------------------------------------------------------------------*/
+
+    p.type
+        AS predecessor_work_type,
+
+
+    /*--------------------------------------------------------------------------
+      PREDECESSOR TOPIC HIERARCHY
+    --------------------------------------------------------------------------*/
+
+    p.primary_topic.id
+        AS predecessor_topic_id,
+
+    p.primary_topic.subfield.id
+        AS predecessor_subfield_id,
+
+    p.primary_topic.field.id
+        AS predecessor_field_id,
+
+    p.primary_topic.domain.id
+        AS predecessor_domain_id,
+
+
+    /*--------------------------------------------------------------------------
+      PREDECESSOR SOURCE
+    --------------------------------------------------------------------------*/
+
+    p.primary_location.source.id
+        AS predecessor_source_id,
+
+    p.primary_location.source.display_name
+        AS predecessor_source_name,
+
+
+    /*--------------------------------------------------------------------------
+      DISCIPLINARY RELATIONSHIPS
+    --------------------------------------------------------------------------*/
+
+    CASE
+
+        WHEN
+            f.topic_id IS NOT NULL
+            AND p.primary_topic.id IS NOT NULL
+            AND f.topic_id =
+                p.primary_topic.id
+
+            THEN TRUE
+
+        ELSE FALSE
+
+    END AS same_topic,
+
+
+    CASE
+
+        WHEN
+            f.subfield_id IS NOT NULL
+            AND p.primary_topic.subfield.id IS NOT NULL
+            AND f.subfield_id =
+                p.primary_topic.subfield.id
+
+            THEN TRUE
+
+        ELSE FALSE
+
+    END AS same_subfield,
+
+
+    CASE
+
+        WHEN
+            f.field_id IS NOT NULL
+            AND p.primary_topic.field.id IS NOT NULL
+            AND f.field_id =
+                p.primary_topic.field.id
+
+            THEN TRUE
+
+        ELSE FALSE
+
+    END AS same_field,
+
+
+    CASE
+
+        WHEN
+            f.domain_id IS NOT NULL
+            AND p.primary_topic.domain.id IS NOT NULL
+            AND f.domain_id =
+                p.primary_topic.domain.id
+
+            THEN TRUE
+
+        ELSE FALSE
+
+    END AS same_domain,
+
+
+    /*--------------------------------------------------------------------------
+      PREDECESSOR PRIOR CITATIONS
+
+      Only years strictly before the focal accepted year are included.
+    --------------------------------------------------------------------------*/
+
+    COALESCE(
+
+        (
+            SELECT
+                SUM(
+                    cy.cited_by_count
+                )
+
+            FROM UNNEST(
+                p.counts_by_year
+            ) AS cy
+
+            WHERE
+                cy.year <
+                f.accepted_year
+        ),
+
+        0
+
+    ) AS predecessor_prior_citations_pre_focal_year,
+
+
+    LN(
+
+        1
+        +
+        COALESCE(
+
+            (
+                SELECT
+                    SUM(
+                        cy.cited_by_count
+                    )
+
+                FROM UNNEST(
+                    p.counts_by_year
+                ) AS cy
+
+                WHERE
+                    cy.year <
+                    f.accepted_year
+            ),
+
+            0
+
+        )
+
+    ) AS predecessor_log_prior_citations,
+
+
+    /*--------------------------------------------------------------------------
+      TEMPORAL VALIDITY
+
+      A predecessor is temporally valid when:
+
+          valid publication date
+          AND publication date <= focal citation-start date
+    --------------------------------------------------------------------------*/
+
+    CASE
+
+        WHEN
+            SAFE_CAST(
+                NULLIF(
+                    TRIM(
+                        p.publication_date
+                    ),
+                    ''
+                )
+                AS DATE
+            ) IS NOT NULL
+
+            AND
+
+            SAFE_CAST(
+                NULLIF(
+                    TRIM(
+                        p.publication_date
+                    ),
+                    ''
+                )
+                AS DATE
+            ) <=
+            f.citation_start_date
+
+            THEN TRUE
+
+        ELSE FALSE
+
+    END AS predecessor_temporally_valid,
+
+
+    /*--------------------------------------------------------------------------
+      PREDECESSOR AFTER FOCAL
+
+      This variable now DEFINITELY exists before QC.
+    --------------------------------------------------------------------------*/
+
+    CASE
+
+        WHEN
+            SAFE_CAST(
+                NULLIF(
+                    TRIM(
+                        p.publication_date
+                    ),
+                    ''
+                )
+                AS DATE
+            ) IS NOT NULL
+
+            AND
+
+            SAFE_CAST(
+                NULLIF(
+                    TRIM(
+                        p.publication_date
+                    ),
+                    ''
+                )
+                AS DATE
+            ) >
+            f.citation_start_date
+
+            THEN TRUE
+
+        ELSE FALSE
+
+    END AS predecessor_after_focal,
+
+
+    /*--------------------------------------------------------------------------
+      PREDECESSOR AGE IN DAYS
+    --------------------------------------------------------------------------*/
+
+    CASE
+
+        WHEN
+            SAFE_CAST(
+                NULLIF(
+                    TRIM(
+                        p.publication_date
+                    ),
+                    ''
+                )
+                AS DATE
+            ) IS NOT NULL
+
+            AND
+
+            SAFE_CAST(
+                NULLIF(
+                    TRIM(
+                        p.publication_date
+                    ),
+                    ''
+                )
+                AS DATE
+            ) <=
+            f.citation_start_date
+
+            THEN DATE_DIFF(
+
+                f.citation_start_date,
+
+                SAFE_CAST(
+                    NULLIF(
+                        TRIM(
+                            p.publication_date
+                        ),
+                        ''
+                    )
+                    AS DATE
+                ),
+
+                DAY
+
+            )
+
+        ELSE NULL
+
+    END AS predecessor_age_days,
+
+
+    /*--------------------------------------------------------------------------
+      PREDECESSOR AGE IN YEARS
+    --------------------------------------------------------------------------*/
+
+    CASE
+
+        WHEN
+            SAFE_CAST(
+                NULLIF(
+                    TRIM(
+                        p.publication_date
+                    ),
+                    ''
+                )
+                AS DATE
+            ) IS NOT NULL
+
+            AND
+
+            SAFE_CAST(
+                NULLIF(
+                    TRIM(
+                        p.publication_date
+                    ),
+                    ''
+                )
+                AS DATE
+            ) <=
+            f.citation_start_date
+
+            THEN SAFE_DIVIDE(
+
+                DATE_DIFF(
+
+                    f.citation_start_date,
+
+                    SAFE_CAST(
+                        NULLIF(
+                            TRIM(
+                                p.publication_date
+                            ),
+                            ''
+                        )
+                        AS DATE
+                    ),
+
+                    DAY
+
+                ),
+
+                365.25
+
+            )
+
+        ELSE NULL
+
+    END AS predecessor_age_years
+
+
+FROM `redo.m4_focal` AS f
+
+CROSS JOIN UNNEST(
+    f.referenced_works
+) AS r
+
+LEFT JOIN
+    `subugoe-collaborative.openalex_walden.works` AS p
+
+    ON REGEXP_EXTRACT(
+        p.id,
+        r'(W[0-9]+)$'
+    )
+    =
+    REGEXP_EXTRACT(
+        r,
+        r'(W[0-9]+)$'
+    )
+
+WHERE
+
+    r IS NOT NULL;
+
+
+
+/*==============================================================================
+QC — PREDECESSOR MATCHING / CHRONOLOGY
+==============================================================================*/
+
+SELECT
+
+    COUNT(*) AS n_focal_reference_rows,
+
+    COUNT(
+        DISTINCT focal_openalex_id
+    ) AS n_focal_papers_with_reference_rows,
+
+    COUNT(
+        DISTINCT predecessor_openalex_id
+    ) AS n_unique_predecessors,
+
+
+    /*--------------------------------------------------------------------------
+      MATCHING
+    --------------------------------------------------------------------------*/
+
+    COUNTIF(
+        predecessor_work_matched
+    ) AS predecessor_matched,
+
+    COUNTIF(
+        NOT predecessor_work_matched
+    ) AS predecessor_not_matched,
+
+    SAFE_DIVIDE(
+        COUNTIF(
+            NOT predecessor_work_matched
+        ),
+        COUNT(*)
+    ) AS share_predecessor_unmatched,
+
+
+    /*--------------------------------------------------------------------------
+      DATE QUALITY
+    --------------------------------------------------------------------------*/
+
+    COUNTIF(
+        predecessor_date_valid
+    ) AS predecessor_valid_date,
+
+    COUNTIF(
+        NOT predecessor_date_valid
+    ) AS predecessor_missing_or_invalid_date,
+
+    SAFE_DIVIDE(
+        COUNTIF(
+            NOT predecessor_date_valid
+        ),
+        COUNT(*)
+    ) AS share_predecessor_missing_or_invalid_date,
+
+
+    /*--------------------------------------------------------------------------
+      CHRONOLOGY
+    --------------------------------------------------------------------------*/
+
+    COUNTIF(
+        predecessor_after_focal
+    ) AS predecessor_after_focal,
+
+    SAFE_DIVIDE(
+        COUNTIF(
+            predecessor_after_focal
+        ),
+        COUNT(*)
+    ) AS share_predecessor_after_focal,
+
+
+    COUNTIF(
+        predecessor_temporally_valid
+    ) AS temporally_valid_predecessors,
+
+
+    /*--------------------------------------------------------------------------
+      AGE
+    --------------------------------------------------------------------------*/
+
+    AVG(
+        IF(
+            predecessor_temporally_valid,
+            predecessor_age_years,
+            NULL
+        )
+    ) AS mean_valid_predecessor_age_years,
+
+    APPROX_QUANTILES(
+        IF(
+            predecessor_temporally_valid,
+            predecessor_age_years,
+            NULL
+        ),
+        100
+    )[OFFSET(50)] AS median_valid_predecessor_age_years,
+
+    APPROX_QUANTILES(
+        IF(
+            predecessor_temporally_valid,
+            predecessor_age_years,
+            NULL
+        ),
+        100
+    )[OFFSET(25)] AS p25_valid_predecessor_age_years,
+
+    APPROX_QUANTILES(
+        IF(
+            predecessor_temporally_valid,
+            predecessor_age_years,
+            NULL
+        ),
+        100
+    )[OFFSET(75)] AS p75_valid_predecessor_age_years
+
+FROM `redo.m4_focal_reference`;
+
+
+/*==============================================================================
+QC — YEAR OF FOCAL PAPER
+==============================================================================*/
+
+SELECT
+
+    focal_accepted_year,
+
+    COUNT(*) AS n_reference_rows,
+
+    COUNTIF(
+        predecessor_work_matched
+    ) AS predecessor_matched,
+
+    COUNTIF(
+        NOT predecessor_work_matched
+    ) AS predecessor_unmatched,
+
+    SAFE_DIVIDE(
+        COUNTIF(
+            NOT predecessor_work_matched
+        ),
+        COUNT(*)
+    ) AS share_unmatched,
+
+    COUNTIF(
+        predecessor_after_focal
+    ) AS predecessor_after_focal,
+
+    COUNTIF(
+        predecessor_temporally_valid
+    ) AS temporally_valid,
+
+    AVG(
+        IF(
+            predecessor_temporally_valid,
+            predecessor_age_years,
+            NULL
+        )
+    ) AS mean_valid_predecessor_age_years
+
+FROM `redo.m4_focal_reference`
+
+GROUP BY
+    focal_accepted_year
+
+ORDER BY
+    focal_accepted_year;
+/*==============================================================================
+SECTION 5
+REFERENCE COMPOSITION SUMMARY — CORRECTED
+==============================================================================
+
+PURPOSE
+-------
+
+Construct focal-paper reference-composition variables for later adjustment,
+heterogeneity, and robustness analyses.
+
+IMPORTANT DISTINCTION
+---------------------
+
+RAW REFERENCE UNIVERSE:
+    all references listed by the focal paper
+
+RESOLVED REFERENCE UNIVERSE:
+    references successfully matched to an OpenAlex work
+
+TEMPORALLY VALID REFERENCE UNIVERSE:
+    matched references with a valid publication date on/before the focal
+    citation-start date
+
+Reference-composition controls are calculated ONLY from the temporally valid
+reference universe.
+
+However, raw reference counts are retained because the primary knowledge-
+retention denominator remains the focal paper's complete observed reference
+list.
+
+==============================================================================*/
+
+
+CREATE OR REPLACE TABLE `redo.m4_focal_reference_summary`
+CLUSTER BY
+    accepted_year,
+    subfield_id,
+    source_id
+AS
+
+
+WITH
+
+
+/*==============================================================================
+5A. BASIC REFERENCE COVERAGE + COMPOSITION
+==============================================================================*/
+
+basic AS (
+
+    SELECT
+
+        r.focal_openalex_id,
+
+        f.accepted_year,
+
+        f.subfield_id,
+
+        f.field_id,
+
+        f.domain_id,
+
+        f.source_id,
+
+
+        /*----------------------------------------------------------------------
+          REFERENCE COVERAGE
+        ----------------------------------------------------------------------*/
+
+        f.reference_count
+            AS reference_count_raw,
+
+
+        COUNT(*)
+            AS reference_rows_observed,
+
+
+        COUNTIF(
+            r.predecessor_work_matched
+        ) AS reference_count_resolved,
+
+
+        COUNTIF(
+            r.predecessor_temporally_valid
+        ) AS reference_count_temporally_valid,
+
+
+        COUNTIF(
+            r.predecessor_after_focal
+        ) AS reference_count_after_focal,
+
+
+        SAFE_DIVIDE(
+            COUNTIF(
+                r.predecessor_work_matched
+            ),
+            COUNT(*)
+        ) AS share_references_resolved,
+
+
+        SAFE_DIVIDE(
+            COUNTIF(
+                r.predecessor_temporally_valid
+            ),
+            COUNT(*)
+        ) AS share_references_temporally_valid,
+
+
+        SAFE_DIVIDE(
+            COUNTIF(
+                r.predecessor_after_focal
+            ),
+            COUNT(*)
+        ) AS share_references_after_focal,
+
+
+        /*----------------------------------------------------------------------
+          REFERENCE AGE
+
+          Only temporally valid predecessors.
+        ----------------------------------------------------------------------*/
+
+        AVG(
+            IF(
+                r.predecessor_temporally_valid,
+                r.predecessor_age_years,
+                NULL
+            )
+        ) AS mean_reference_age_years,
+
+
+        APPROX_QUANTILES(
+            IF(
+                r.predecessor_temporally_valid,
+                r.predecessor_age_years,
+                NULL
+            ),
+            100
+        )[OFFSET(50)] AS median_reference_age_years,
+
+
+        APPROX_QUANTILES(
+            IF(
+                r.predecessor_temporally_valid,
+                r.predecessor_age_years,
+                NULL
+            ),
+            100
+        )[OFFSET(25)] AS p25_reference_age_years,
+
+
+        APPROX_QUANTILES(
+            IF(
+                r.predecessor_temporally_valid,
+                r.predecessor_age_years,
+                NULL
+            ),
+            100
+        )[OFFSET(75)] AS p75_reference_age_years,
+
+
+        /*----------------------------------------------------------------------
+          PREDECESSOR PROMINENCE
+
+          Only temporally valid predecessors.
+        ----------------------------------------------------------------------*/
+
+        AVG(
+            IF(
+                r.predecessor_temporally_valid,
+                r.predecessor_log_prior_citations,
+                NULL
+            )
+        ) AS mean_log_prior_citations,
+
+
+        APPROX_QUANTILES(
+            IF(
+                r.predecessor_temporally_valid,
+                r.predecessor_log_prior_citations,
+                NULL
+            ),
+            100
+        )[OFFSET(50)] AS median_log_prior_citations,
+
+
+        SAFE_DIVIDE(
+
+            COUNTIF(
+                r.predecessor_temporally_valid
+                AND
+                r.predecessor_prior_citations_pre_focal_year = 0
+            ),
+
+            COUNTIF(
+                r.predecessor_temporally_valid
+            )
+
+        ) AS share_refs_uncited_before_focal_year,
+
+
+        /*----------------------------------------------------------------------
+          REFERENCE AGE COMPOSITION
+
+          Denominator:
+              temporally valid references only
+        ----------------------------------------------------------------------*/
+
+        SAFE_DIVIDE(
+
+            COUNTIF(
+                r.predecessor_temporally_valid
+                AND
+                r.predecessor_age_years >= 0
+                AND
+                r.predecessor_age_years < 3
+            ),
+
+            COUNTIF(
+                r.predecessor_temporally_valid
+            )
+
+        ) AS share_refs_age_lt3,
+
+
+        SAFE_DIVIDE(
+
+            COUNTIF(
+                r.predecessor_temporally_valid
+                AND
+                r.predecessor_age_years >= 3
+                AND
+                r.predecessor_age_years <= 5
+            ),
+
+            COUNTIF(
+                r.predecessor_temporally_valid
+            )
+
+        ) AS share_refs_age_3_5,
+
+
+        SAFE_DIVIDE(
+
+            COUNTIF(
+                r.predecessor_temporally_valid
+                AND
+                r.predecessor_age_years > 5
+                AND
+                r.predecessor_age_years <= 10
+            ),
+
+            COUNTIF(
+                r.predecessor_temporally_valid
+            )
+
+        ) AS share_refs_age_6_10,
+
+
+        SAFE_DIVIDE(
+
+            COUNTIF(
+                r.predecessor_temporally_valid
+                AND
+                r.predecessor_age_years > 10
+            ),
+
+            COUNTIF(
+                r.predecessor_temporally_valid
+            )
+
+        ) AS share_refs_age_11plus,
+
+
+        /*----------------------------------------------------------------------
+          DISCIPLINARY ALIGNMENT
+
+          Denominator:
+              temporally valid references with corresponding metadata
+
+          This avoids treating missing topic/field metadata as "different".
+        ----------------------------------------------------------------------*/
+
+        SAFE_DIVIDE(
+
+            COUNTIF(
+                r.predecessor_temporally_valid
+                AND
+                r.predecessor_topic_id IS NOT NULL
+                AND
+                r.same_topic
+            ),
+
+            COUNTIF(
+                r.predecessor_temporally_valid
+                AND
+                r.predecessor_topic_id IS NOT NULL
+                AND
+                f.topic_id IS NOT NULL
+            )
+
+        ) AS share_refs_same_topic,
+
+
+        SAFE_DIVIDE(
+
+            COUNTIF(
+                r.predecessor_temporally_valid
+                AND
+                r.predecessor_subfield_id IS NOT NULL
+                AND
+                r.same_subfield
+            ),
+
+            COUNTIF(
+                r.predecessor_temporally_valid
+                AND
+                r.predecessor_subfield_id IS NOT NULL
+                AND
+                f.subfield_id IS NOT NULL
+            )
+
+        ) AS share_refs_same_subfield,
+
+
+        SAFE_DIVIDE(
+
+            COUNTIF(
+                r.predecessor_temporally_valid
+                AND
+                r.predecessor_field_id IS NOT NULL
+                AND
+                r.same_field
+            ),
+
+            COUNTIF(
+                r.predecessor_temporally_valid
+                AND
+                r.predecessor_field_id IS NOT NULL
+                AND
+                f.field_id IS NOT NULL
+            )
+
+        ) AS share_refs_same_field,
+
+
+        SAFE_DIVIDE(
+
+            COUNTIF(
+                r.predecessor_temporally_valid
+                AND
+                r.predecessor_domain_id IS NOT NULL
+                AND
+                r.same_domain
+            ),
+
+            COUNTIF(
+                r.predecessor_temporally_valid
+                AND
+                r.predecessor_domain_id IS NOT NULL
+                AND
+                f.domain_id IS NOT NULL
+            )
+
+        ) AS share_refs_same_domain,
+
+
+        SAFE_DIVIDE(
+
+            COUNTIF(
+                r.predecessor_temporally_valid
+                AND
+                r.predecessor_field_id IS NOT NULL
+                AND
+                f.field_id IS NOT NULL
+                AND
+                NOT r.same_field
+            ),
+
+            COUNTIF(
+                r.predecessor_temporally_valid
+                AND
+                r.predecessor_field_id IS NOT NULL
+                AND
+                f.field_id IS NOT NULL
+            )
+
+        ) AS share_refs_outside_field,
+
+
+        SAFE_DIVIDE(
+
+            COUNTIF(
+                r.predecessor_temporally_valid
+                AND
+                r.predecessor_domain_id IS NOT NULL
+                AND
+                f.domain_id IS NOT NULL
+                AND
+                NOT r.same_domain
+            ),
+
+            COUNTIF(
+                r.predecessor_temporally_valid
+                AND
+                r.predecessor_domain_id IS NOT NULL
+                AND
+                f.domain_id IS NOT NULL
+            )
+
+        ) AS share_refs_outside_domain
+
+
+    FROM `redo.m4_focal_reference` AS r
+
+    INNER JOIN `redo.m4_focal` AS f
+
+        ON r.focal_openalex_id =
+           f.openalex_id
+
+
+    GROUP BY
+
+        r.focal_openalex_id,
+
+        f.accepted_year,
+
+        f.topic_id,
+
+        f.subfield_id,
+
+        f.field_id,
+
+        f.domain_id,
+
+        f.source_id,
+
+        f.reference_count
+
+),
+
+
+/*==============================================================================
+5B. TOPIC DISTRIBUTION
+
+Only temporally valid references.
+==============================================================================*/
+
+topic_counts AS (
+
+    SELECT
+
+        focal_openalex_id,
+
+        predecessor_topic_id,
+
+        COUNT(*) AS n
+
+    FROM `redo.m4_focal_reference`
+
+    WHERE
+
+        predecessor_temporally_valid
+
+        AND predecessor_topic_id IS NOT NULL
+
+    GROUP BY
+
+        focal_openalex_id,
+
+        predecessor_topic_id
+
+),
+
+
+topic_totals AS (
+
+    SELECT
+
+        focal_openalex_id,
+
+        SUM(n)
+            AS total_n,
+
+        COUNT(*)
+            AS n_reference_topics
+
+    FROM topic_counts
+
+    GROUP BY
+        focal_openalex_id
+
+),
+
+
+topic_entropy AS (
+
+    SELECT
+
+        c.focal_openalex_id,
+
+        t.n_reference_topics,
+
+        -SUM(
+
+            SAFE_DIVIDE(
+                c.n,
+                t.total_n
+            )
+
+            *
+
+            LN(
+                SAFE_DIVIDE(
+                    c.n,
+                    t.total_n
+                )
+            )
+
+        ) AS reference_topic_entropy
+
+    FROM topic_counts AS c
+
+    INNER JOIN topic_totals AS t
+
+        USING (
+            focal_openalex_id
+        )
+
+    GROUP BY
+
+        c.focal_openalex_id,
+
+        t.n_reference_topics
+
+),
+
+
+/*==============================================================================
+5C. SUBFIELD DISTRIBUTION
+==============================================================================*/
+
+subfield_counts AS (
+
+    SELECT
+
+        focal_openalex_id,
+
+        predecessor_subfield_id,
+
+        COUNT(*) AS n
+
+    FROM `redo.m4_focal_reference`
+
+    WHERE
+
+        predecessor_temporally_valid
+
+        AND predecessor_subfield_id IS NOT NULL
+
+    GROUP BY
+
+        focal_openalex_id,
+
+        predecessor_subfield_id
+
+),
+
+
+subfield_totals AS (
+
+    SELECT
+
+        focal_openalex_id,
+
+        SUM(n)
+            AS total_n,
+
+        COUNT(*)
+            AS n_reference_subfields
+
+    FROM subfield_counts
+
+    GROUP BY
+        focal_openalex_id
+
+),
+
+
+subfield_entropy AS (
+
+    SELECT
+
+        c.focal_openalex_id,
+
+        t.n_reference_subfields,
+
+        -SUM(
+
+            SAFE_DIVIDE(
+                c.n,
+                t.total_n
+            )
+
+            *
+
+            LN(
+                SAFE_DIVIDE(
+                    c.n,
+                    t.total_n
+                )
+            )
+
+        ) AS reference_subfield_entropy
+
+    FROM subfield_counts AS c
+
+    INNER JOIN subfield_totals AS t
+
+        USING (
+            focal_openalex_id
+        )
+
+    GROUP BY
+
+        c.focal_openalex_id,
+
+        t.n_reference_subfields
+
+),
+
+
+/*==============================================================================
+5D. FIELD DISTRIBUTION
+==============================================================================*/
+
+field_counts AS (
+
+    SELECT
+
+        focal_openalex_id,
+
+        predecessor_field_id,
+
+        COUNT(*) AS n
+
+    FROM `redo.m4_focal_reference`
+
+    WHERE
+
+        predecessor_temporally_valid
+
+        AND predecessor_field_id IS NOT NULL
+
+    GROUP BY
+
+        focal_openalex_id,
+
+        predecessor_field_id
+
+),
+
+
+field_totals AS (
+
+    SELECT
+
+        focal_openalex_id,
+
+        SUM(n)
+            AS total_n,
+
+        COUNT(*)
+            AS n_reference_fields
+
+    FROM field_counts
+
+    GROUP BY
+        focal_openalex_id
+
+),
+
+
+field_entropy AS (
+
+    SELECT
+
+        c.focal_openalex_id,
+
+        t.n_reference_fields,
+
+        -SUM(
+
+            SAFE_DIVIDE(
+                c.n,
+                t.total_n
+            )
+
+            *
+
+            LN(
+                SAFE_DIVIDE(
+                    c.n,
+                    t.total_n
+                )
+            )
+
+        ) AS reference_field_entropy
+
+    FROM field_counts AS c
+
+    INNER JOIN field_totals AS t
+
+        USING (
+            focal_openalex_id
+        )
+
+    GROUP BY
+
+        c.focal_openalex_id,
+
+        t.n_reference_fields
+
+)
+
+
+/*==============================================================================
+5E. FINAL REFERENCE SUMMARY
+==============================================================================*/
+
+SELECT
+
+    b.*,
+
+    t.n_reference_topics,
+
+    t.reference_topic_entropy,
+
+    s.n_reference_subfields,
+
+    s.reference_subfield_entropy,
+
+    fi.n_reference_fields,
+
+    fi.reference_field_entropy
+
+FROM basic AS b
+
+LEFT JOIN topic_entropy AS t
+
+    USING (
+        focal_openalex_id
+    )
+
+LEFT JOIN subfield_entropy AS s
+
+    USING (
+        focal_openalex_id
+    )
+
+LEFT JOIN field_entropy AS fi
+
+    USING (
+        focal_openalex_id
+    );
+
+
+/*==============================================================================
+SECTION 5F
+REFERENCE SUMMARY QC
+==============================================================================*/
+
+SELECT
+
+    COUNT(*) AS n_focal_papers,
+
+    AVG(
+        reference_count_raw
+    ) AS mean_raw_references,
+
+    AVG(
+        reference_count_resolved
+    ) AS mean_resolved_references,
+
+    AVG(
+        reference_count_temporally_valid
+    ) AS mean_temporally_valid_references,
+
+    AVG(
+        share_references_resolved
+    ) AS mean_share_references_resolved,
+
+    AVG(
+        share_references_temporally_valid
+    ) AS mean_share_references_temporally_valid,
+
+    AVG(
+        share_references_after_focal
+    ) AS mean_share_references_after_focal,
+
+    AVG(
+        mean_reference_age_years
+    ) AS mean_focal_reference_age,
+
+    AVG(
+        reference_topic_entropy
+    ) AS mean_topic_entropy,
+
+    AVG(
+        reference_subfield_entropy
+    ) AS mean_subfield_entropy,
+
+    AVG(
+        reference_field_entropy
+    ) AS mean_field_entropy
+
+FROM `redo.m4_focal_reference_summary`;
+
+
+
+/*==============================================================================
+SECTION 6
+DESCENDANT MASTER — CORRECTED
+==============================================================================
+
+KEY FIX
+-------
+The focal author arrays are explicitly carried from focal_authors into matched.
+
+No EXISTS subquery is used in a JOIN predicate.
+
+MATCHING LOGIC
+--------------
+1. Read OpenAlex works from partition years 2010-2026.
+2. UNNEST each citing paper's referenced_works.
+3. Normalize each referenced work to W########.
+4. Directly join that reference ID to the focal OpenAlex ID.
+5. Carry focal author sets into the matched rows.
+6. Calculate author-overlap variables.
+7. Keep observed descendants through the 36-month endpoint / snapshot.
+
+2025 remains in the table.
+
+==============================================================================*/
+
+
+CREATE OR REPLACE TABLE `redo.m4_focal_descendant`
+CLUSTER BY
+    focal_openalex_id,
+    citing_openalex_id
+AS
+
+WITH
+
+
+/*==============================================================================
+6A. FOCAL PAPERS
+==============================================================================*/
+
+focal AS (
+
+    SELECT
+
+        f.openalex_id
+            AS focal_openalex_id,
+
+        f.focal_first_author_id,
+
+        f.accepted_year
+            AS focal_accepted_year,
+
+        f.ai_score
+            AS focal_ai_score,
+
+        f.authors_count
+            AS focal_authors_count,
+
+        f.reference_count
+            AS focal_reference_count,
+
+        f.work_type
+            AS focal_work_type,
+
+        f.topic_id
+            AS focal_topic_id,
+
+        f.subfield_id
+            AS focal_subfield_id,
+
+        f.field_id
+            AS focal_field_id,
+
+        f.domain_id
+            AS focal_domain_id,
+
+        f.source_id
+            AS focal_source_id,
+
+        f.citation_start_date,
+
+        f.followup_12m_date,
+
+        f.followup_24m_date,
+
+        f.followup_36m_date,
+
+        f.eligible_12m,
+
+        f.eligible_24m,
+
+        f.eligible_36m
+
+    FROM `redo.m4_focal` AS f
+
+),
+
+
+/*==============================================================================
+6B. FOCAL AUTHOR SETS
+==============================================================================*/
+
+focal_authors AS (
+
+    SELECT
+
+        focal_openalex_id,
+
+        focal_author_ids,
+
+        focal_first_author_ids,
+
+        focal_last_author_ids,
+
+        focal_corresponding_author_ids
+
+    FROM `redo.m4_focal_author_set`
+
+),
+
+
+/*==============================================================================
+6C. PARTITION-PRUNED CITING WORKS
+==============================================================================*/
+
+candidate_citers AS (
+
+    SELECT
+
+        w.id
+            AS citing_openalex_id,
+
+        w.publication_date
+            AS citing_publication_date_raw,
+
+        SAFE_CAST(
+            NULLIF(
+                TRIM(
+                    w.publication_date
+                ),
+                ''
+            )
+            AS DATE
+        ) AS citing_publication_date,
+
+        w.publication_year
+            AS citing_publication_year,
+
+        w.type
+            AS citing_work_type,
+
+        w.primary_topic.id
+            AS citing_topic_id,
+
+        w.primary_topic.subfield.id
+            AS citing_subfield_id,
+
+        w.primary_topic.field.id
+            AS citing_field_id,
+
+        w.primary_topic.domain.id
+            AS citing_domain_id,
+
+        w.primary_location.source.id
+            AS citing_source_id,
+
+        w.primary_location.source.display_name
+            AS citing_source_name,
+
+        w.primary_location.source.is_core
+            AS citing_source_is_core,
+
+        w.primary_location.source.is_oa
+            AS citing_source_is_oa,
+
+        w.referenced_works_count
+            AS citing_reference_count,
+
+        w.authorships
+            AS citing_authorships,
+
+        w.corresponding_author_ids
+            AS citing_corresponding_author_ids,
+
+        w.referenced_works
+            AS citing_referenced_works
+
+    FROM
+        `subugoe-collaborative.openalex_walden.works` AS w
+
+    WHERE
+
+        w.publication_year BETWEEN
+            2010 AND 2026
+
+),
+
+
+/*==============================================================================
+6D. EXPLODE CITING REFERENCE LISTS
+==============================================================================*/
+
+citing_reference_edges AS (
+
+    SELECT
+
+        c.citing_openalex_id,
+
+        c.citing_publication_date_raw,
+
+        c.citing_publication_date,
+
+        c.citing_publication_year,
+
+        c.citing_work_type,
+
+        c.citing_topic_id,
+
+        c.citing_subfield_id,
+
+        c.citing_field_id,
+
+        c.citing_domain_id,
+
+        c.citing_source_id,
+
+        c.citing_source_name,
+
+        c.citing_source_is_core,
+
+        c.citing_source_is_oa,
+
+        c.citing_reference_count,
+
+        c.citing_authorships,
+
+        c.citing_corresponding_author_ids,
+
+        c.citing_referenced_works,
+
+        REGEXP_EXTRACT(
+            ref,
+            r'(W[0-9]+)$'
+        ) AS referenced_openalex_id
+
+    FROM candidate_citers AS c
+
+    CROSS JOIN UNNEST(
+        c.citing_referenced_works
+    ) AS ref
+
+    WHERE
+
+        REGEXP_EXTRACT(
+            ref,
+            r'(W[0-9]+)$'
+        ) IS NOT NULL
+
+),
+
+
+/*==============================================================================
+6E. DIRECT FOCAL -> DESCENDANT MATCH
+
+CRITICAL:
+Carry all focal author arrays into this CTE.
+==============================================================================*/
+
+matched AS (
+
+    SELECT
+
+        f.focal_openalex_id,
+
+        f.focal_first_author_id,
+
+        f.focal_accepted_year,
+
+        f.focal_ai_score,
+
+        f.focal_authors_count,
+
+        f.focal_reference_count,
+
+        f.focal_work_type,
+
+        f.focal_topic_id,
+
+        f.focal_subfield_id,
+
+        f.focal_field_id,
+
+        f.focal_domain_id,
+
+        f.focal_source_id,
+
+        f.citation_start_date,
+
+        f.followup_12m_date,
+
+        f.followup_24m_date,
+
+        f.followup_36m_date,
+
+        f.eligible_12m,
+
+        f.eligible_24m,
+
+        f.eligible_36m,
+
+
+        /*----------------------------------------------------------------------
+          FOCAL AUTHOR SETS
+        ----------------------------------------------------------------------*/
+
+        fa.focal_author_ids,
+
+        fa.focal_first_author_ids,
+
+        fa.focal_last_author_ids,
+
+        fa.focal_corresponding_author_ids,
+
+
+        /*----------------------------------------------------------------------
+          CITING PAPER
+        ----------------------------------------------------------------------*/
+
+        c.citing_openalex_id,
+
+        c.citing_publication_date_raw,
+
+        c.citing_publication_date,
+
+        c.citing_publication_year,
+
+        c.citing_work_type,
+
+        c.citing_topic_id,
+
+        c.citing_subfield_id,
+
+        c.citing_field_id,
+
+        c.citing_domain_id,
+
+        c.citing_source_id,
+
+        c.citing_source_name,
+
+        c.citing_source_is_core,
+
+        c.citing_source_is_oa,
+
+        c.citing_reference_count,
+
+        c.citing_authorships,
+
+        c.citing_corresponding_author_ids,
+
+        c.citing_referenced_works
+
+    FROM focal AS f
+
+    INNER JOIN citing_reference_edges AS c
+
+        ON c.referenced_openalex_id =
+           f.focal_openalex_id
+
+    INNER JOIN focal_authors AS fa
+
+        ON f.focal_openalex_id =
+           fa.focal_openalex_id
+
+    WHERE
+
+        c.citing_publication_date IS NOT NULL
+
+        AND c.citing_publication_date >=
+            f.citation_start_date
+
+        AND c.citing_publication_date <=
+            DATE '2026-06-26'
+
+        AND c.citing_publication_date <=
+            f.followup_36m_date
+
+),
+
+
+/*==============================================================================
+6F. CONSTRUCT CITING AUTHOR / REFERENCE ID SETS
+==============================================================================*/
+
+author_sets AS (
+
+    SELECT
+
+        m.*,
+
+
+        /*----------------------------------------------------------------------
+          ALL CITING AUTHORS
+        ----------------------------------------------------------------------*/
+
+        ARRAY(
+
+            SELECT DISTINCT
+
+                a.author.id
+
+            FROM UNNEST(
+                m.citing_authorships
+            ) AS a
+
+            WHERE
+
+                a.author.id IS NOT NULL
+
+        ) AS citing_author_ids,
+
+
+        /*----------------------------------------------------------------------
+          CITING FIRST AUTHORS
+        ----------------------------------------------------------------------*/
+
+        ARRAY(
+
+            SELECT DISTINCT
+
+                a.author.id
+
+            FROM UNNEST(
+                m.citing_authorships
+            ) AS a
+
+            WHERE
+
+                a.author.id IS NOT NULL
+
+                AND a.author_position = 'first'
+
+        ) AS citing_first_author_ids,
+
+
+        /*----------------------------------------------------------------------
+          CITING LAST AUTHORS
+        ----------------------------------------------------------------------*/
+
+        ARRAY(
+
+            SELECT DISTINCT
+
+                a.author.id
+
+            FROM UNNEST(
+                m.citing_authorships
+            ) AS a
+
+            WHERE
+
+                a.author.id IS NOT NULL
+
+                AND a.author_position = 'last'
+
+        ) AS citing_last_author_ids,
+
+
+        /*----------------------------------------------------------------------
+          NORMALIZED CITING REFERENCE IDS
+        ----------------------------------------------------------------------*/
+
+        ARRAY(
+
+            SELECT DISTINCT
+
+                REGEXP_EXTRACT(
+                    ref,
+                    r'(W[0-9]+)$'
+                )
+
+            FROM UNNEST(
+                m.citing_referenced_works
+            ) AS ref
+
+            WHERE
+
+                REGEXP_EXTRACT(
+                    ref,
+                    r'(W[0-9]+)$'
+                ) IS NOT NULL
+
+        ) AS citing_referenced_work_ids
+
+    FROM matched AS m
+
+),
+
+
+/*==============================================================================
+6G. AUTHOR OVERLAP
+==============================================================================*/
+
+overlap AS (
+
+    SELECT
+
+        a.*,
+
+
+        /*----------------------------------------------------------------------
+          SHARED AUTHORS
+        ----------------------------------------------------------------------*/
+
+        ARRAY(
+
+            SELECT DISTINCT
+
+                author_id
+
+            FROM UNNEST(
+                a.citing_author_ids
+            ) AS author_id
+
+            WHERE
+
+                author_id IN UNNEST(
+                    a.focal_author_ids
+                )
+
+        ) AS shared_author_ids,
+
+
+        /*----------------------------------------------------------------------
+          SHARED FIRST AUTHORS
+        ----------------------------------------------------------------------*/
+
+        ARRAY(
+
+            SELECT DISTINCT
+
+                author_id
+
+            FROM UNNEST(
+                a.citing_author_ids
+            ) AS author_id
+
+            WHERE
+
+                author_id IN UNNEST(
+                    a.focal_first_author_ids
+                )
+
+        ) AS shared_first_author_ids,
+
+
+        /*----------------------------------------------------------------------
+          SHARED LAST AUTHORS
+        ----------------------------------------------------------------------*/
+
+        ARRAY(
+
+            SELECT DISTINCT
+
+                author_id
+
+            FROM UNNEST(
+                a.citing_author_ids
+            ) AS author_id
+
+            WHERE
+
+                author_id IN UNNEST(
+                    a.focal_last_author_ids
+                )
+
+        ) AS shared_last_author_ids,
+
+
+        /*----------------------------------------------------------------------
+          SHARED CORRESPONDING AUTHORS
+        ----------------------------------------------------------------------*/
+
+        ARRAY(
+
+            SELECT DISTINCT
+
+                author_id
+
+            FROM UNNEST(
+                a.citing_author_ids
+            ) AS author_id
+
+            WHERE
+
+                author_id IN UNNEST(
+                    a.focal_corresponding_author_ids
+                )
+
+        ) AS shared_corresponding_author_ids
+
+    FROM author_sets AS a
+
+)
+
+
+/*==============================================================================
+6H. FINAL DESCENDANT TABLE
+==============================================================================*/
+
+SELECT
+
+    /*--------------------------------------------------------------------------
+      FOCAL
+    --------------------------------------------------------------------------*/
+
+    focal_openalex_id,
+
+    focal_first_author_id,
+
+    focal_accepted_year,
+
+    focal_ai_score,
+
+    focal_authors_count,
+
+    focal_reference_count,
+
+    focal_work_type,
+
+    focal_topic_id,
+
+    focal_subfield_id,
+
+    focal_field_id,
+
+    focal_domain_id,
+
+    focal_source_id,
+
+    citation_start_date,
+
+    followup_12m_date,
+
+    followup_24m_date,
+
+    followup_36m_date,
+
+    eligible_12m,
+
+    eligible_24m,
+
+    eligible_36m,
+
+
+    /*--------------------------------------------------------------------------
+      DESCENDANT
+    --------------------------------------------------------------------------*/
+
+    citing_openalex_id,
+
+    citing_publication_date_raw,
+
+    citing_publication_date,
+
+    citing_publication_year,
+
+    citing_work_type,
+
+    citing_topic_id,
+
+    citing_subfield_id,
+
+    citing_field_id,
+
+    citing_domain_id,
+
+    citing_source_id,
+
+    citing_source_name,
+
+    citing_source_is_core,
+
+    citing_source_is_oa,
+
+    citing_reference_count,
+
+
+    /*--------------------------------------------------------------------------
+      CITATION LAG
+    --------------------------------------------------------------------------*/
+
+    DATE_DIFF(
+        citing_publication_date,
+        citation_start_date,
+        DAY
+    ) AS citation_lag_days,
+
+
+    SAFE_DIVIDE(
+
+        DATE_DIFF(
+            citing_publication_date,
+            citation_start_date,
+            DAY
+        ),
+
+        365.25
+
+    ) AS citation_lag_years,
+
+
+    /*--------------------------------------------------------------------------
+      OBSERVED WINDOWS
+    --------------------------------------------------------------------------*/
+
+    (
+        citing_publication_date <=
+        followup_12m_date
+    ) AS observed_within_12m,
+
+
+    (
+        citing_publication_date <=
+        followup_24m_date
+    ) AS observed_within_24m,
+
+
+    (
+        citing_publication_date <=
+        followup_36m_date
+    ) AS observed_within_36m,
+
+
+    /*--------------------------------------------------------------------------
+      COMPLETE FIXED WINDOWS
+    --------------------------------------------------------------------------*/
+
+    (
+        eligible_12m
+        AND
+        citing_publication_date <=
+            followup_12m_date
+    ) AS within_12m,
+
+
+    (
+        eligible_24m
+        AND
+        citing_publication_date <=
+            followup_24m_date
+    ) AS within_24m,
+
+
+    (
+        eligible_36m
+        AND
+        citing_publication_date <=
+            followup_36m_date
+    ) AS within_36m,
+
+
+    /*--------------------------------------------------------------------------
+      REFERENCE IDS USED BY SECTION 8
+    --------------------------------------------------------------------------*/
+
+    citing_referenced_work_ids,
+
+
+    /*--------------------------------------------------------------------------
+      AUTHOR OVERLAP
+    --------------------------------------------------------------------------*/
+
+    ARRAY_LENGTH(
+        shared_author_ids
+    ) AS n_shared_authors,
+
+
+    (
+        ARRAY_LENGTH(
+            shared_author_ids
+        ) > 0
+    ) AS any_shared_author,
+
+
+    (
+        ARRAY_LENGTH(
+            shared_first_author_ids
+        ) > 0
+    ) AS shares_focal_first_author,
+
+
+    (
+        ARRAY_LENGTH(
+            shared_last_author_ids
+        ) > 0
+    ) AS shares_focal_last_author,
+
+
+    (
+        ARRAY_LENGTH(
+            shared_corresponding_author_ids
+        ) > 0
+    ) AS shares_focal_corresponding_author,
+
+
+    /*--------------------------------------------------------------------------
+      AUTHOR COUNTS
+    --------------------------------------------------------------------------*/
+
+    ARRAY_LENGTH(
+        focal_author_ids
+    ) AS focal_openalex_author_count,
+
+
+    ARRAY_LENGTH(
+        citing_author_ids
+    ) AS citing_openalex_author_count
+
+FROM overlap;
+
+
+/*==============================================================================
+SECTION 7
+DESCENDANT QC
+==============================================================================*/
+
+SELECT
+
+    COUNT(*) AS focal_descendant_rows,
+
+    COUNT(
+        DISTINCT focal_openalex_id
+    ) AS focal_papers_with_observed_descendants,
+
+    COUNT(
+        DISTINCT citing_openalex_id
+    ) AS unique_citing_papers,
+
+
+    /*--------------------------------------------------------------------------
+      AUTHOR OVERLAP
+    --------------------------------------------------------------------------*/
+
+    COUNTIF(
+        any_shared_author
+    ) AS rows_with_author_overlap,
+
+    COUNTIF(
+        NOT any_shared_author
+    ) AS rows_external,
+
+    SAFE_DIVIDE(
+        COUNTIF(
+            any_shared_author
+        ),
+        COUNT(*)
+    ) AS share_descendants_with_author_overlap,
+
+
+    /*--------------------------------------------------------------------------
+      DATES
+    --------------------------------------------------------------------------*/
+
+    MIN(
+        citing_publication_date
+    ) AS earliest_citing_date,
+
+    MAX(
+        citing_publication_date
+    ) AS latest_citing_date,
+
+
+    /*--------------------------------------------------------------------------
+      OBSERVED WINDOWS
+    --------------------------------------------------------------------------*/
+
+    COUNTIF(
+        observed_within_12m
+    ) AS observed_rows_12m,
+
+    COUNTIF(
+        observed_within_24m
+    ) AS observed_rows_24m,
+
+    COUNTIF(
+        observed_within_36m
+    ) AS observed_rows_36m,
+
+
+    /*--------------------------------------------------------------------------
+      COMPLETE WINDOWS
+    --------------------------------------------------------------------------*/
+
+    COUNTIF(
+        within_12m
+    ) AS complete_window_rows_12m,
+
+    COUNTIF(
+        within_24m
+    ) AS complete_window_rows_24m,
+
+    COUNTIF(
+        within_36m
+    ) AS complete_window_rows_36m,
+
+
+    /*--------------------------------------------------------------------------
+      2025
+    --------------------------------------------------------------------------*/
+
+    COUNTIF(
+        focal_accepted_year = 2025
+    ) AS descendant_rows_2025,
+
+    COUNTIF(
+        focal_accepted_year = 2025
+        AND observed_within_12m
+    ) AS observed_2025_rows_12m,
+
+    COUNTIF(
+        focal_accepted_year = 2025
+        AND within_12m
+    ) AS complete_2025_rows_12m
+
+FROM `redo.m4_focal_descendant`;
+
+
+/*==============================================================================
+SECTION 7B
+DESCENDANT QC BY FOCAL YEAR
+==============================================================================*/
+
+SELECT
+
+    focal_accepted_year,
+
+    COUNT(
+        DISTINCT focal_openalex_id
+    ) AS focal_papers_with_observed_descendants,
+
+    COUNT(*) AS descendant_rows,
+
+    COUNTIF(
+        observed_within_12m
+    ) AS observed_rows_12m,
+
+    COUNTIF(
+        within_12m
+    ) AS complete_rows_12m,
+
+    COUNTIF(
+        within_24m
+    ) AS complete_rows_24m,
+
+    COUNTIF(
+        within_36m
+    ) AS complete_rows_36m,
+
+    COUNTIF(
+        any_shared_author
+    ) AS author_overlap_rows,
+
+    COUNTIF(
+        NOT any_shared_author
+    ) AS external_rows,
+
+    SAFE_DIVIDE(
+        COUNTIF(
+            any_shared_author
+        ),
+        COUNT(*)
+    ) AS share_author_overlap
+
+FROM `redo.m4_focal_descendant`
+
+GROUP BY
+    focal_accepted_year
+
+ORDER BY
+    focal_accepted_year;
+
+
+/*==============================================================================
+SECTION 8
+POSITIVE KNOWLEDGE-REUSE EDGES
+==============================================================================
+
+One row:
+
+    focal paper × predecessor × descendant
+
+A reuse edge exists when the same normalized OpenAlex predecessor ID appears
+in both:
+
+    focal reference list
+    citing-paper reference list
+
+We do NOT require predecessor metadata to be resolved here.
+
+==============================================================================*/
+
+
+CREATE OR REPLACE TABLE `redo.m4_reuse_edge`
+CLUSTER BY
+    focal_openalex_id,
+    predecessor_openalex_id,
+    citing_openalex_id
+AS
+
+SELECT DISTINCT
+
+    d.focal_openalex_id,
+
+    r.predecessor_openalex_id,
+
+    d.citing_openalex_id,
+
+    d.focal_accepted_year,
+
+    d.citing_publication_date,
+
+    d.citing_publication_year,
+
+    d.citation_lag_days,
+
+    d.citation_lag_years,
+
+
+    /*--------------------------------------------------------------------------
+      OBSERVED
+    --------------------------------------------------------------------------*/
+
+    d.observed_within_12m,
+
+    d.observed_within_24m,
+
+    d.observed_within_36m,
+
+
+    /*--------------------------------------------------------------------------
+      COMPLETE
+    --------------------------------------------------------------------------*/
+
+    d.within_12m,
+
+    d.within_24m,
+
+    d.within_36m,
+
+
+    /*--------------------------------------------------------------------------
+      AUTHOR OVERLAP
+    --------------------------------------------------------------------------*/
+
+    d.any_shared_author,
+
+    d.n_shared_authors,
+
+    d.shares_focal_first_author,
+
+    d.shares_focal_last_author,
+
+    d.shares_focal_corresponding_author,
+
+
+    /*--------------------------------------------------------------------------
+      PREDECESSOR DATA QUALITY
+    --------------------------------------------------------------------------*/
+
+    r.predecessor_work_matched,
+
+    r.predecessor_date_valid,
+
+    r.predecessor_temporally_valid,
+
+    r.predecessor_after_focal,
+
+
+    /*--------------------------------------------------------------------------
+      PREDECESSOR CHARACTERISTICS
+    --------------------------------------------------------------------------*/
+
+    r.predecessor_age_years,
+
+    r.predecessor_publication_year,
+
+    r.predecessor_prior_citations_pre_focal_year,
+
+    r.predecessor_log_prior_citations,
+
+    r.same_topic,
+
+    r.same_subfield,
+
+    r.same_field,
+
+    r.same_domain
+
+FROM `redo.m4_focal_descendant` AS d
+
+INNER JOIN `redo.m4_focal_reference` AS r
+
+    ON d.focal_openalex_id =
+       r.focal_openalex_id
+
+    AND r.predecessor_openalex_id
+        IN UNNEST(
+            d.citing_referenced_work_ids
+        );
+
+
+/*==============================================================================
+SECTION 9
+REUSE-EDGE QC
+==============================================================================*/
+
+SELECT
+
+    COUNT(*) AS reuse_edge_rows,
+
+    COUNT(
+        DISTINCT focal_openalex_id
+    ) AS focal_papers_with_reuse,
+
+    COUNT(
+        DISTINCT predecessor_openalex_id
+    ) AS unique_predecessors_reused,
+
+    COUNT(
+        DISTINCT citing_openalex_id
+    ) AS unique_descendants_reusing_predecessors,
+
+
+    /*--------------------------------------------------------------------------
+      COMPLETE-WINDOW REUSE
+    --------------------------------------------------------------------------*/
+
+    COUNTIF(
+        within_12m
+    ) AS reuse_edges_12m,
+
+    COUNTIF(
+        within_24m
+    ) AS reuse_edges_24m,
+
+    COUNTIF(
+        within_36m
+    ) AS reuse_edges_36m,
+
+
+    /*--------------------------------------------------------------------------
+      EXTERNAL COMPLETE-WINDOW REUSE
+    --------------------------------------------------------------------------*/
+
+    COUNTIF(
+        within_12m
+        AND NOT any_shared_author
+    ) AS external_reuse_edges_12m,
+
+    COUNTIF(
+        within_24m
+        AND NOT any_shared_author
+    ) AS external_reuse_edges_24m,
+
+    COUNTIF(
+        within_36m
+        AND NOT any_shared_author
+    ) AS external_reuse_edges_36m
+
+FROM `redo.m4_reuse_edge`;
+
+/*==============================================================================
+SECTION 9B
+FOCAL-PAPER REUSE CONCENTRATION
+==============================================================================
+
+For each focal paper and horizon:
+
+    predecessor_reuse_count =
+        number of distinct descendants that reuse a predecessor
+
+Then calculate:
+
+    HHI     = sum(s_r^2)
+
+    entropy = -sum(s_r * ln(s_r))
+
+where:
+
+    s_r =
+        predecessor reuse count /
+        total predecessor reuse count
+
+Higher HHI:
+    more concentrated knowledge transmission.
+
+Higher entropy:
+    more broadly distributed knowledge transmission.
+
+Separate versions:
+    all descendants
+    external descendants only.
+
+==============================================================================*/
+
+
+CREATE OR REPLACE TABLE `redo.m4_reuse_concentration`
+CLUSTER BY
+    focal_openalex_id
+AS
+
+WITH
+
+
+/*==============================================================================
+12 MONTH — ALL
+==============================================================================*/
+
+reuse_12_all AS (
+
+    SELECT
+
+        focal_openalex_id,
+
+        predecessor_openalex_id,
+
+        COUNT(
+            DISTINCT citing_openalex_id
+        ) AS n_reusing_descendants
+
+    FROM `redo.m4_reuse_edge`
+
+    WHERE
+        within_12m
+
+    GROUP BY
+        focal_openalex_id,
+        predecessor_openalex_id
+
+),
+
+
+reuse_12_all_total AS (
+
+    SELECT
+
+        focal_openalex_id,
+
+        SUM(
+            n_reusing_descendants
+        ) AS total_reuse,
+
+        COUNT(*) AS n_reused_predecessors
+
+    FROM reuse_12_all
+
+    GROUP BY
+        focal_openalex_id
+
+),
+
+
+conc_12_all AS (
+
+    SELECT
+
+        r.focal_openalex_id,
+
+        t.n_reused_predecessors,
+
+        SUM(
+            POW(
+                SAFE_DIVIDE(
+                    r.n_reusing_descendants,
+                    t.total_reuse
+                ),
+                2
+            )
+        ) AS reuse_hhi_12m_all,
+
+        -SUM(
+
+            SAFE_DIVIDE(
+                r.n_reusing_descendants,
+                t.total_reuse
+            )
+
+            *
+
+            LN(
+                SAFE_DIVIDE(
+                    r.n_reusing_descendants,
+                    t.total_reuse
+                )
+            )
+
+        ) AS reuse_entropy_12m_all
+
+    FROM reuse_12_all AS r
+
+    INNER JOIN reuse_12_all_total AS t
+        USING (focal_openalex_id)
+
+    GROUP BY
+        r.focal_openalex_id,
+        t.n_reused_predecessors
+
+),
+
+
+/*==============================================================================
+24 MONTH — ALL
+==============================================================================*/
+
+reuse_24_all AS (
+
+    SELECT
+
+        focal_openalex_id,
+
+        predecessor_openalex_id,
+
+        COUNT(
+            DISTINCT citing_openalex_id
+        ) AS n_reusing_descendants
+
+    FROM `redo.m4_reuse_edge`
+
+    WHERE
+        within_24m
+
+    GROUP BY
+        focal_openalex_id,
+        predecessor_openalex_id
+
+),
+
+
+reuse_24_all_total AS (
+
+    SELECT
+
+        focal_openalex_id,
+
+        SUM(
+            n_reusing_descendants
+        ) AS total_reuse,
+
+        COUNT(*) AS n_reused_predecessors
+
+    FROM reuse_24_all
+
+    GROUP BY
+        focal_openalex_id
+
+),
+
+
+conc_24_all AS (
+
+    SELECT
+
+        r.focal_openalex_id,
+
+        t.n_reused_predecessors,
+
+        SUM(
+            POW(
+                SAFE_DIVIDE(
+                    r.n_reusing_descendants,
+                    t.total_reuse
+                ),
+                2
+            )
+        ) AS reuse_hhi_24m_all,
+
+        -SUM(
+
+            SAFE_DIVIDE(
+                r.n_reusing_descendants,
+                t.total_reuse
+            )
+
+            *
+
+            LN(
+                SAFE_DIVIDE(
+                    r.n_reusing_descendants,
+                    t.total_reuse
+                )
+            )
+
+        ) AS reuse_entropy_24m_all
+
+    FROM reuse_24_all AS r
+
+    INNER JOIN reuse_24_all_total AS t
+        USING (focal_openalex_id)
+
+    GROUP BY
+        r.focal_openalex_id,
+        t.n_reused_predecessors
+
+),
+
+
+/*==============================================================================
+36 MONTH — ALL
+==============================================================================*/
+
+reuse_36_all AS (
+
+    SELECT
+
+        focal_openalex_id,
+
+        predecessor_openalex_id,
+
+        COUNT(
+            DISTINCT citing_openalex_id
+        ) AS n_reusing_descendants
+
+    FROM `redo.m4_reuse_edge`
+
+    WHERE
+        within_36m
+
+    GROUP BY
+        focal_openalex_id,
+        predecessor_openalex_id
+
+),
+
+
+reuse_36_all_total AS (
+
+    SELECT
+
+        focal_openalex_id,
+
+        SUM(
+            n_reusing_descendants
+        ) AS total_reuse,
+
+        COUNT(*) AS n_reused_predecessors
+
+    FROM reuse_36_all
+
+    GROUP BY
+        focal_openalex_id
+
+),
+
+
+conc_36_all AS (
+
+    SELECT
+
+        r.focal_openalex_id,
+
+        t.n_reused_predecessors,
+
+        SUM(
+            POW(
+                SAFE_DIVIDE(
+                    r.n_reusing_descendants,
+                    t.total_reuse
+                ),
+                2
+            )
+        ) AS reuse_hhi_36m_all,
+
+        -SUM(
+
+            SAFE_DIVIDE(
+                r.n_reusing_descendants,
+                t.total_reuse
+            )
+
+            *
+
+            LN(
+                SAFE_DIVIDE(
+                    r.n_reusing_descendants,
+                    t.total_reuse
+                )
+            )
+
+        ) AS reuse_entropy_36m_all
+
+    FROM reuse_36_all AS r
+
+    INNER JOIN reuse_36_all_total AS t
+        USING (focal_openalex_id)
+
+    GROUP BY
+        r.focal_openalex_id,
+        t.n_reused_predecessors
+
+),
+
+
+/*==============================================================================
+12 MONTH — EXTERNAL DESCENDANTS
+==============================================================================*/
+
+reuse_12_external AS (
+
+    SELECT
+
+        focal_openalex_id,
+
+        predecessor_openalex_id,
+
+        COUNT(
+            DISTINCT citing_openalex_id
+        ) AS n_reusing_descendants
+
+    FROM `redo.m4_reuse_edge`
+
+    WHERE
+
+        within_12m
+
+        AND NOT any_shared_author
+
+    GROUP BY
+        focal_openalex_id,
+        predecessor_openalex_id
+
+),
+
+
+reuse_12_external_total AS (
+
+    SELECT
+
+        focal_openalex_id,
+
+        SUM(
+            n_reusing_descendants
+        ) AS total_reuse,
+
+        COUNT(*) AS n_reused_predecessors
+
+    FROM reuse_12_external
+
+    GROUP BY
+        focal_openalex_id
+
+),
+
+
+conc_12_external AS (
+
+    SELECT
+
+        r.focal_openalex_id,
+
+        t.n_reused_predecessors,
+
+        SUM(
+            POW(
+                SAFE_DIVIDE(
+                    r.n_reusing_descendants,
+                    t.total_reuse
+                ),
+                2
+            )
+        ) AS reuse_hhi_12m_external,
+
+        -SUM(
+
+            SAFE_DIVIDE(
+                r.n_reusing_descendants,
+                t.total_reuse
+            )
+
+            *
+
+            LN(
+                SAFE_DIVIDE(
+                    r.n_reusing_descendants,
+                    t.total_reuse
+                )
+            )
+
+        ) AS reuse_entropy_12m_external
+
+    FROM reuse_12_external AS r
+
+    INNER JOIN reuse_12_external_total AS t
+        USING (focal_openalex_id)
+
+    GROUP BY
+        r.focal_openalex_id,
+        t.n_reused_predecessors
+
+)
+
+
+/*==============================================================================
+FINAL CONCENTRATION TABLE
+==============================================================================*/
+
+SELECT
+
+    f.openalex_id
+        AS focal_openalex_id,
+
+
+    /*--------------------------------------------------------------------------
+      12 MONTH
+    --------------------------------------------------------------------------*/
+
+    c12.reuse_hhi_12m_all,
+
+    c12.reuse_entropy_12m_all,
+
+    c12.n_reused_predecessors
+        AS n_reused_predecessors_12m_all,
+
+
+    /*--------------------------------------------------------------------------
+      24 MONTH
+    --------------------------------------------------------------------------*/
+
+    c24.reuse_hhi_24m_all,
+
+    c24.reuse_entropy_24m_all,
+
+    c24.n_reused_predecessors
+        AS n_reused_predecessors_24m_all,
+
+
+    /*--------------------------------------------------------------------------
+      36 MONTH
+    --------------------------------------------------------------------------*/
+
+    c36.reuse_hhi_36m_all,
+
+    c36.reuse_entropy_36m_all,
+
+    c36.n_reused_predecessors
+        AS n_reused_predecessors_36m_all,
+
+
+    /*--------------------------------------------------------------------------
+      12 MONTH EXTERNAL
+    --------------------------------------------------------------------------*/
+
+    c12e.reuse_hhi_12m_external,
+
+    c12e.reuse_entropy_12m_external,
+
+    c12e.n_reused_predecessors
+        AS n_reused_predecessors_12m_external
+
+
+FROM `redo.m4_focal` AS f
+
+LEFT JOIN conc_12_all AS c12
+    ON f.openalex_id =
+       c12.focal_openalex_id
+
+LEFT JOIN conc_24_all AS c24
+    ON f.openalex_id =
+       c24.focal_openalex_id
+
+LEFT JOIN conc_36_all AS c36
+    ON f.openalex_id =
+       c36.focal_openalex_id
+
+LEFT JOIN conc_12_external AS c12e
+    ON f.openalex_id =
+       c12e.focal_openalex_id;
+
+
+/*==============================================================================
+CONCENTRATION QC
+==============================================================================*/
+
+SELECT
+
+    COUNT(*) AS n_focal_papers,
+
+    COUNTIF(
+        reuse_hhi_12m_all IS NOT NULL
+    ) AS n_with_12m_concentration,
+
+    COUNTIF(
+        reuse_hhi_24m_all IS NOT NULL
+    ) AS n_with_24m_concentration,
+
+    COUNTIF(
+        reuse_hhi_36m_all IS NOT NULL
+    ) AS n_with_36m_concentration,
+
+    AVG(
+        reuse_hhi_12m_all
+    ) AS mean_hhi_12m,
+
+    AVG(
+        reuse_entropy_12m_all
+    ) AS mean_entropy_12m,
+
+    AVG(
+        reuse_hhi_12m_external
+    ) AS mean_external_hhi_12m,
+
+    AVG(
+        reuse_entropy_12m_external
+    ) AS mean_external_entropy_12m
+
+FROM `redo.m4_reuse_concentration`;
+/*==============================================================================
+SECTION 10
+DESCENDANT SUMMARY
+==============================================================================*/
+
+CREATE OR REPLACE TABLE `redo.m4_focal_descendant_summary`
+CLUSTER BY
+    focal_accepted_year,
+    focal_subfield_id
+AS
+
+SELECT
+
+    focal_openalex_id,
+
+    ANY_VALUE(
+        focal_accepted_year
+    ) AS focal_accepted_year,
+
+    ANY_VALUE(
+        focal_subfield_id
+    ) AS focal_subfield_id,
+
+
+    /*--------------------------------------------------------------------------
+      COMPLETE CITATION OPPORTUNITY
+    --------------------------------------------------------------------------*/
+
+    COUNT(
+        DISTINCT IF(
+            within_12m,
+            citing_openalex_id,
+            NULL
+        )
+    ) AS n_descendants_12m,
+
+    COUNT(
+        DISTINCT IF(
+            within_24m,
+            citing_openalex_id,
+            NULL
+        )
+    ) AS n_descendants_24m,
+
+    COUNT(
+        DISTINCT IF(
+            within_36m,
+            citing_openalex_id,
+            NULL
+        )
+    ) AS n_descendants_36m,
+
+
+    /*--------------------------------------------------------------------------
+      OBSERVED CITATION OPPORTUNITY
+    --------------------------------------------------------------------------*/
+
+    COUNT(
+        DISTINCT IF(
+            observed_within_12m,
+            citing_openalex_id,
+            NULL
+        )
+    ) AS n_observed_descendants_12m,
+
+    COUNT(
+        DISTINCT citing_openalex_id
+    ) AS n_observed_descendants_to_snapshot,
+
+
+    /*--------------------------------------------------------------------------
+      EXTERNAL DESCENDANTS
+    --------------------------------------------------------------------------*/
+
+    COUNT(
+        DISTINCT IF(
+            within_12m
+            AND NOT any_shared_author,
+            citing_openalex_id,
+            NULL
+        )
+    ) AS n_external_descendants_12m,
+
+    COUNT(
+        DISTINCT IF(
+            within_24m
+            AND NOT any_shared_author,
+            citing_openalex_id,
+            NULL
+        )
+    ) AS n_external_descendants_24m,
+
+    COUNT(
+        DISTINCT IF(
+            within_36m
+            AND NOT any_shared_author,
+            citing_openalex_id,
+            NULL
+        )
+    ) AS n_external_descendants_36m,
+
+
+    /*--------------------------------------------------------------------------
+      EXTERNAL DESCENDANT SHARES
+    --------------------------------------------------------------------------*/
+
+    SAFE_DIVIDE(
+
+        COUNT(
+            DISTINCT IF(
+                within_12m
+                AND NOT any_shared_author,
+                citing_openalex_id,
+                NULL
+            )
+        ),
+
+        COUNT(
+            DISTINCT IF(
+                within_12m,
+                citing_openalex_id,
+                NULL
+            )
+        )
+
+    ) AS share_external_descendants_12m,
+
+
+    SAFE_DIVIDE(
+
+        COUNT(
+            DISTINCT IF(
+                within_24m
+                AND NOT any_shared_author,
+                citing_openalex_id,
+                NULL
+            )
+        ),
+
+        COUNT(
+            DISTINCT IF(
+                within_24m,
+                citing_openalex_id,
+                NULL
+            )
+        )
+
+    ) AS share_external_descendants_24m,
+
+
+    SAFE_DIVIDE(
+
+        COUNT(
+            DISTINCT IF(
+                within_36m
+                AND NOT any_shared_author,
+                citing_openalex_id,
+                NULL
+            )
+        ),
+
+        COUNT(
+            DISTINCT IF(
+                within_36m,
+                citing_openalex_id,
+                NULL
+            )
+        )
+
+    ) AS share_external_descendants_36m,
+
+
+    /*--------------------------------------------------------------------------
+      AUTHOR-CONTINUATION SHARE
+    --------------------------------------------------------------------------*/
+
+    SAFE_DIVIDE(
+
+        COUNT(
+            DISTINCT IF(
+                within_12m
+                AND any_shared_author,
+                citing_openalex_id,
+                NULL
+            )
+        ),
+
+        COUNT(
+            DISTINCT IF(
+                within_12m,
+                citing_openalex_id,
+                NULL
+            )
+        )
+
+    ) AS share_descendants_any_author_overlap_12m,
+
+
+    SAFE_DIVIDE(
+
+        COUNT(
+            DISTINCT IF(
+                within_12m
+                AND shares_focal_first_author,
+                citing_openalex_id,
+                NULL
+            )
+        ),
+
+        COUNT(
+            DISTINCT IF(
+                within_12m,
+                citing_openalex_id,
+                NULL
+            )
+        )
+
+    ) AS share_descendants_focal_first_author_12m,
+
+
+    /*--------------------------------------------------------------------------
+      DESCENDANT DISCIPLINARY COMPOSITION
+    --------------------------------------------------------------------------*/
+
+    SAFE_DIVIDE(
+
+        COUNT(
+            DISTINCT IF(
+                within_12m
+                AND citing_subfield_id IS NOT NULL
+                AND focal_subfield_id IS NOT NULL
+                AND citing_subfield_id =
+                    focal_subfield_id,
+                citing_openalex_id,
+                NULL
+            )
+        ),
+
+        COUNT(
+            DISTINCT IF(
+                within_12m
+                AND citing_subfield_id IS NOT NULL
+                AND focal_subfield_id IS NOT NULL,
+                citing_openalex_id,
+                NULL
+            )
+        )
+
+    ) AS share_descendants_same_subfield_12m,
+
+
+    SAFE_DIVIDE(
+
+        COUNT(
+            DISTINCT IF(
+                within_12m
+                AND citing_field_id IS NOT NULL
+                AND focal_field_id IS NOT NULL
+                AND citing_field_id =
+                    focal_field_id,
+                citing_openalex_id,
+                NULL
+            )
+        ),
+
+        COUNT(
+            DISTINCT IF(
+                within_12m
+                AND citing_field_id IS NOT NULL
+                AND focal_field_id IS NOT NULL,
+                citing_openalex_id,
+                NULL
+            )
+        )
+
+    ) AS share_descendants_same_field_12m,
+
+
+    /*--------------------------------------------------------------------------
+      CITATION LAG
+    --------------------------------------------------------------------------*/
+
+    AVG(
+        IF(
+            within_12m,
+            citation_lag_days,
+            NULL
+        )
+    ) AS mean_citation_lag_days_12m,
+
+
+    APPROX_QUANTILES(
+        IF(
+            within_12m,
+            citation_lag_days,
+            NULL
+        ),
+        100
+    )[OFFSET(50)] AS median_citation_lag_days_12m
+
+FROM `redo.m4_focal_descendant`
+
+GROUP BY
+    focal_openalex_id;
+
+
+
+/*==============================================================================
+SECTION 11
+FINAL M4 RETENTION SUMMARY
+==============================================================================*/
+
+CREATE OR REPLACE TABLE `redo.m4_retention_summary`
+CLUSTER BY
+    accepted_year,
+    subfield_id,
+    source_id
+AS
+
+WITH reuse AS (
+
+    SELECT
+
+        focal_openalex_id,
+
+
+        /*----------------------------------------------------------------------
+          Retained predecessors — complete windows
+        ----------------------------------------------------------------------*/
+
+        COUNT(
+            DISTINCT IF(
+                within_12m,
+                predecessor_openalex_id,
+                NULL
+            )
+        ) AS retained_predecessors_12m_all,
+
+        COUNT(
+            DISTINCT IF(
+                within_24m,
+                predecessor_openalex_id,
+                NULL
+            )
+        ) AS retained_predecessors_24m_all,
+
+        COUNT(
+            DISTINCT IF(
+                within_36m,
+                predecessor_openalex_id,
+                NULL
+            )
+        ) AS retained_predecessors_36m_all,
+
+
+        /*----------------------------------------------------------------------
+          External retained predecessors
+        ----------------------------------------------------------------------*/
+
+        COUNT(
+            DISTINCT IF(
+                within_12m
+                AND NOT any_shared_author,
+                predecessor_openalex_id,
+                NULL
+            )
+        ) AS retained_predecessors_12m_external,
+
+        COUNT(
+            DISTINCT IF(
+                within_24m
+                AND NOT any_shared_author,
+                predecessor_openalex_id,
+                NULL
+            )
+        ) AS retained_predecessors_24m_external,
+
+        COUNT(
+            DISTINCT IF(
+                within_36m
+                AND NOT any_shared_author,
+                predecessor_openalex_id,
+                NULL
+            )
+        ) AS retained_predecessors_36m_external,
+
+
+        /*----------------------------------------------------------------------
+          Temporally valid robustness numerator
+        ----------------------------------------------------------------------*/
+
+        COUNT(
+            DISTINCT IF(
+                within_12m
+                AND predecessor_temporally_valid,
+                predecessor_openalex_id,
+                NULL
+            )
+        ) AS retained_predecessors_12m_temporally_valid,
+
+        COUNT(
+            DISTINCT IF(
+                within_24m
+                AND predecessor_temporally_valid,
+                predecessor_openalex_id,
+                NULL
+            )
+        ) AS retained_predecessors_24m_temporally_valid,
+
+        COUNT(
+            DISTINCT IF(
+                within_36m
+                AND predecessor_temporally_valid,
+                predecessor_openalex_id,
+                NULL
+            )
+        ) AS retained_predecessors_36m_temporally_valid,
+
+
+        /*----------------------------------------------------------------------
+          Observed retention
+        ----------------------------------------------------------------------*/
+
+        COUNT(
+            DISTINCT IF(
+                observed_within_12m,
+                predecessor_openalex_id,
+                NULL
+            )
+        ) AS observed_retained_predecessors_12m_all,
+
+        COUNT(
+            DISTINCT predecessor_openalex_id
+        ) AS observed_retained_predecessors_to_snapshot,
+
+
+        /*----------------------------------------------------------------------
+          Reuse events
+        ----------------------------------------------------------------------*/
+
+        COUNTIF(
+            within_12m
+        ) AS reuse_events_12m_all,
+
+        COUNTIF(
+            within_24m
+        ) AS reuse_events_24m_all,
+
+        COUNTIF(
+            within_36m
+        ) AS reuse_events_36m_all,
+
+
+        COUNTIF(
+            within_12m
+            AND NOT any_shared_author
+        ) AS reuse_events_12m_external,
+
+        COUNTIF(
+            within_24m
+            AND NOT any_shared_author
+        ) AS reuse_events_24m_external,
+
+        COUNTIF(
+            within_36m
+            AND NOT any_shared_author
+        ) AS reuse_events_36m_external,
+
+
+        /*----------------------------------------------------------------------
+          Descendants reusing at least one predecessor
+        ----------------------------------------------------------------------*/
+
+        COUNT(
+            DISTINCT IF(
+                within_12m,
+                citing_openalex_id,
+                NULL
+            )
+        ) AS reusing_descendants_12m_all,
+
+        COUNT(
+            DISTINCT IF(
+                within_24m,
+                citing_openalex_id,
+                NULL
+            )
+        ) AS reusing_descendants_24m_all,
+
+        COUNT(
+            DISTINCT IF(
+                within_36m,
+                citing_openalex_id,
+                NULL
+            )
+        ) AS reusing_descendants_36m_all
+
+
+    FROM `redo.m4_reuse_edge`
+
+    GROUP BY
+        focal_openalex_id
+
+)
+
+
+SELECT
+
+    f.*,
+
+
+    /*--------------------------------------------------------------------------
+      COVERAGE FLAGS
+    --------------------------------------------------------------------------*/
+
+    (
+        f.openalex_id_raw IS NULL
+    ) AS openalex_work_unmatched,
+
+
+    (
+        f.accepted_year = 2025
+        AND NOT f.eligible_12m
+    ) AS is_2025_incomplete_12m,
+
+
+    /*--------------------------------------------------------------------------
+      REFERENCE COVERAGE
+    --------------------------------------------------------------------------*/
+
+    rs.reference_count_raw,
+
+    rs.reference_rows_observed,
+
+    rs.reference_count_resolved,
+
+    rs.reference_count_temporally_valid,
+
+    rs.reference_count_after_focal,
+
+    rs.share_references_resolved,
+
+    rs.share_references_temporally_valid,
+
+    rs.share_references_after_focal,
+
+
+    /*--------------------------------------------------------------------------
+      REFERENCE COMPOSITION
+    --------------------------------------------------------------------------*/
+
+    rs.mean_reference_age_years,
+
+    rs.median_reference_age_years,
+
+    rs.p25_reference_age_years,
+
+    rs.p75_reference_age_years,
+
+    rs.mean_log_prior_citations,
+
+    rs.median_log_prior_citations,
+
+    rs.share_refs_uncited_before_focal_year,
+
+    rs.share_refs_age_lt3,
+
+    rs.share_refs_age_3_5,
+
+    rs.share_refs_age_6_10,
+
+    rs.share_refs_age_11plus,
+
+    rs.share_refs_same_topic,
+
+    rs.share_refs_same_subfield,
+
+    rs.share_refs_same_field,
+
+    rs.share_refs_same_domain,
+
+    rs.share_refs_outside_field,
+
+    rs.share_refs_outside_domain,
+
+    rs.n_reference_topics,
+
+    rs.reference_topic_entropy,
+
+    rs.n_reference_subfields,
+
+    rs.reference_subfield_entropy,
+
+    rs.n_reference_fields,
+
+    rs.reference_field_entropy,
+
+
+    /*--------------------------------------------------------------------------
+      CITATION OPPORTUNITY
+    --------------------------------------------------------------------------*/
+
+    COALESCE(
+        ds.n_descendants_12m,
+        0
+    ) AS n_descendants_12m,
+
+    COALESCE(
+        ds.n_descendants_24m,
+        0
+    ) AS n_descendants_24m,
+
+    COALESCE(
+        ds.n_descendants_36m,
+        0
+    ) AS n_descendants_36m,
+
+
+    COALESCE(
+        ds.n_external_descendants_12m,
+        0
+    ) AS n_external_descendants_12m,
+
+    COALESCE(
+        ds.n_external_descendants_24m,
+        0
+    ) AS n_external_descendants_24m,
+
+    COALESCE(
+        ds.n_external_descendants_36m,
+        0
+    ) AS n_external_descendants_36m,
+
+
+    ds.share_external_descendants_12m,
+
+    ds.share_external_descendants_24m,
+
+    ds.share_external_descendants_36m,
+
+    ds.share_descendants_any_author_overlap_12m,
+
+    ds.share_descendants_focal_first_author_12m,
+
+    ds.share_descendants_same_subfield_12m,
+
+    ds.share_descendants_same_field_12m,
+
+    ds.mean_citation_lag_days_12m,
+
+    ds.median_citation_lag_days_12m,
+
+
+    /*--------------------------------------------------------------------------
+      OBSERVED OPPORTUNITY
+    --------------------------------------------------------------------------*/
+
+    COALESCE(
+        ds.n_observed_descendants_12m,
+        0
+    ) AS n_observed_descendants_12m,
+
+    COALESCE(
+        ds.n_observed_descendants_to_snapshot,
+        0
+    ) AS n_observed_descendants_to_snapshot,
+
+
+    /*--------------------------------------------------------------------------
+      CITATION INDICATORS
+    --------------------------------------------------------------------------*/
+
+    (
+        COALESCE(
+            ds.n_descendants_12m,
+            0
+        ) > 0
+    ) AS cited_within_12m,
+
+
+    (
+        COALESCE(
+            ds.n_descendants_24m,
+            0
+        ) > 0
+    ) AS cited_within_24m,
+
+
+    (
+        COALESCE(
+            ds.n_descendants_36m,
+            0
+        ) > 0
+    ) AS cited_within_36m,
+
+
+    (
+        COALESCE(
+            ds.n_external_descendants_12m,
+            0
+        ) > 0
+    ) AS externally_cited_within_12m,
+
+
+    (
+        COALESCE(
+            ds.n_external_descendants_24m,
+            0
+        ) > 0
+    ) AS externally_cited_within_24m,
+
+
+    (
+        COALESCE(
+            ds.n_external_descendants_36m,
+            0
+        ) > 0
+    ) AS externally_cited_within_36m,
+
+
+    /*--------------------------------------------------------------------------
+      RAW RETENTION COUNTS
+    --------------------------------------------------------------------------*/
+
+    COALESCE(
+        ru.retained_predecessors_12m_all,
+        0
+    ) AS retained_predecessors_12m_all,
+
+    COALESCE(
+        ru.retained_predecessors_24m_all,
+        0
+    ) AS retained_predecessors_24m_all,
+
+    COALESCE(
+        ru.retained_predecessors_36m_all,
+        0
+    ) AS retained_predecessors_36m_all,
+
+
+    COALESCE(
+        ru.retained_predecessors_12m_external,
+        0
+    ) AS retained_predecessors_12m_external,
+
+    COALESCE(
+        ru.retained_predecessors_24m_external,
+        0
+    ) AS retained_predecessors_24m_external,
+
+    COALESCE(
+        ru.retained_predecessors_36m_external,
+        0
+    ) AS retained_predecessors_36m_external,
+
+
+    /*--------------------------------------------------------------------------
+      CONDITIONAL RETENTION — PRIMARY
+    --------------------------------------------------------------------------*/
+
+    CASE
+
+        WHEN
+            f.eligible_12m
+            AND f.reference_count >= 3
+            AND COALESCE(
+                ds.n_descendants_12m,
+                0
+            ) > 0
+
+        THEN SAFE_DIVIDE(
+            COALESCE(
+                ru.retained_predecessors_12m_all,
+                0
+            ),
+            f.reference_count
+        )
+
+        ELSE NULL
+
+    END AS retention_breadth_12m_all_conditional,
+
+
+    CASE
+
+        WHEN
+            f.eligible_24m
+            AND f.reference_count >= 3
+            AND COALESCE(
+                ds.n_descendants_24m,
+                0
+            ) > 0
+
+        THEN SAFE_DIVIDE(
+            COALESCE(
+                ru.retained_predecessors_24m_all,
+                0
+            ),
+            f.reference_count
+        )
+
+        ELSE NULL
+
+    END AS retention_breadth_24m_all_conditional,
+
+
+    CASE
+
+        WHEN
+            f.eligible_36m
+            AND f.reference_count >= 3
+            AND COALESCE(
+                ds.n_descendants_36m,
+                0
+            ) > 0
+
+        THEN SAFE_DIVIDE(
+            COALESCE(
+                ru.retained_predecessors_36m_all,
+                0
+            ),
+            f.reference_count
+        )
+
+        ELSE NULL
+
+    END AS retention_breadth_36m_all_conditional,
+
+
+    /*--------------------------------------------------------------------------
+      CONDITIONAL EXTERNAL RETENTION
+    --------------------------------------------------------------------------*/
+
+    CASE
+
+        WHEN
+            f.eligible_12m
+            AND f.reference_count >= 3
+            AND COALESCE(
+                ds.n_external_descendants_12m,
+                0
+            ) > 0
+
+        THEN SAFE_DIVIDE(
+            COALESCE(
+                ru.retained_predecessors_12m_external,
+                0
+            ),
+            f.reference_count
+        )
+
+        ELSE NULL
+
+    END AS retention_breadth_12m_external_conditional,
+
+
+    CASE
+
+        WHEN
+            f.eligible_24m
+            AND f.reference_count >= 3
+            AND COALESCE(
+                ds.n_external_descendants_24m,
+                0
+            ) > 0
+
+        THEN SAFE_DIVIDE(
+            COALESCE(
+                ru.retained_predecessors_24m_external,
+                0
+            ),
+            f.reference_count
+        )
+
+        ELSE NULL
+
+    END AS retention_breadth_24m_external_conditional,
+
+
+    CASE
+
+        WHEN
+            f.eligible_36m
+            AND f.reference_count >= 3
+            AND COALESCE(
+                ds.n_external_descendants_36m,
+                0
+            ) > 0
+
+        THEN SAFE_DIVIDE(
+            COALESCE(
+                ru.retained_predecessors_36m_external,
+                0
+            ),
+            f.reference_count
+        )
+
+        ELSE NULL
+
+    END AS retention_breadth_36m_external_conditional,
+
+
+    /*--------------------------------------------------------------------------
+      UNCONDITIONAL RETENTION
+    --------------------------------------------------------------------------*/
+
+    CASE
+
+        WHEN
+            f.eligible_12m
+            AND f.reference_count >= 3
+
+        THEN SAFE_DIVIDE(
+            COALESCE(
+                ru.retained_predecessors_12m_all,
+                0
+            ),
+            f.reference_count
+        )
+
+        ELSE NULL
+
+    END AS retention_breadth_12m_all_unconditional,
+
+
+    CASE
+
+        WHEN
+            f.eligible_24m
+            AND f.reference_count >= 3
+
+        THEN SAFE_DIVIDE(
+            COALESCE(
+                ru.retained_predecessors_24m_all,
+                0
+            ),
+            f.reference_count
+        )
+
+        ELSE NULL
+
+    END AS retention_breadth_24m_all_unconditional,
+
+
+    CASE
+
+        WHEN
+            f.eligible_36m
+            AND f.reference_count >= 3
+
+        THEN SAFE_DIVIDE(
+            COALESCE(
+                ru.retained_predecessors_36m_all,
+                0
+            ),
+            f.reference_count
+        )
+
+        ELSE NULL
+
+    END AS retention_breadth_36m_all_unconditional,
+
+
+    /*--------------------------------------------------------------------------
+      VALID-REFERENCE ROBUSTNESS
+    --------------------------------------------------------------------------*/
+
+    CASE
+
+        WHEN
+            f.eligible_12m
+            AND rs.reference_count_temporally_valid >= 3
+            AND COALESCE(
+                ds.n_descendants_12m,
+                0
+            ) > 0
+
+        THEN SAFE_DIVIDE(
+            COALESCE(
+                ru.retained_predecessors_12m_temporally_valid,
+                0
+            ),
+            rs.reference_count_temporally_valid
+        )
+
+        ELSE NULL
+
+    END AS retention_breadth_12m_valid_refs_conditional,
+
+
+    CASE
+
+        WHEN
+            f.eligible_24m
+            AND rs.reference_count_temporally_valid >= 3
+            AND COALESCE(
+                ds.n_descendants_24m,
+                0
+            ) > 0
+
+        THEN SAFE_DIVIDE(
+            COALESCE(
+                ru.retained_predecessors_24m_temporally_valid,
+                0
+            ),
+            rs.reference_count_temporally_valid
+        )
+
+        ELSE NULL
+
+    END AS retention_breadth_24m_valid_refs_conditional,
+
+
+    CASE
+
+        WHEN
+            f.eligible_36m
+            AND rs.reference_count_temporally_valid >= 3
+            AND COALESCE(
+                ds.n_descendants_36m,
+                0
+            ) > 0
+
+        THEN SAFE_DIVIDE(
+            COALESCE(
+                ru.retained_predecessors_36m_temporally_valid,
+                0
+            ),
+            rs.reference_count_temporally_valid
+        )
+
+        ELSE NULL
+
+    END AS retention_breadth_36m_valid_refs_conditional,
+
+
+    /*--------------------------------------------------------------------------
+      OBSERVED RETENTION
+    --------------------------------------------------------------------------*/
+
+    CASE
+
+        WHEN
+            f.reference_count >= 3
+
+        THEN SAFE_DIVIDE(
+            COALESCE(
+                ru.observed_retained_predecessors_12m_all,
+                0
+            ),
+            f.reference_count
+        )
+
+        ELSE NULL
+
+    END AS observed_retention_breadth_12m_all,
+
+
+    CASE
+
+        WHEN
+            f.reference_count >= 3
+
+        THEN SAFE_DIVIDE(
+            COALESCE(
+                ru.observed_retained_predecessors_to_snapshot,
+                0
+            ),
+            f.reference_count
+        )
+
+        ELSE NULL
+
+    END AS observed_retention_breadth_to_snapshot,
+
+
+    /*--------------------------------------------------------------------------
+      DESCENDANT REUSE
+    --------------------------------------------------------------------------*/
+
+    CASE
+
+        WHEN
+            f.eligible_12m
+            AND COALESCE(
+                ds.n_descendants_12m,
+                0
+            ) > 0
+
+        THEN SAFE_DIVIDE(
+            COALESCE(
+                ru.reusing_descendants_12m_all,
+                0
+            ),
+            ds.n_descendants_12m
+        )
+
+        ELSE NULL
+
+    END AS share_descendants_reusing_12m,
+
+
+    CASE
+
+        WHEN
+            f.eligible_24m
+            AND COALESCE(
+                ds.n_descendants_24m,
+                0
+            ) > 0
+
+        THEN SAFE_DIVIDE(
+            COALESCE(
+                ru.reusing_descendants_24m_all,
+                0
+            ),
+            ds.n_descendants_24m
+        )
+
+        ELSE NULL
+
+    END AS share_descendants_reusing_24m,
+
+
+    CASE
+
+        WHEN
+            f.eligible_36m
+            AND COALESCE(
+                ds.n_descendants_36m,
+                0
+            ) > 0
+
+        THEN SAFE_DIVIDE(
+            COALESCE(
+                ru.reusing_descendants_36m_all,
+                0
+            ),
+            ds.n_descendants_36m
+        )
+
+        ELSE NULL
+
+    END AS share_descendants_reusing_36m,
+
+
+    /*--------------------------------------------------------------------------
+      REUSE DEPTH
+    --------------------------------------------------------------------------*/
+
+    CASE
+
+        WHEN
+            f.eligible_12m
+            AND COALESCE(
+                ds.n_descendants_12m,
+                0
+            ) > 0
+
+        THEN SAFE_DIVIDE(
+            COALESCE(
+                ru.reuse_events_12m_all,
+                0
+            ),
+            f.reference_count
+        )
+
+        ELSE NULL
+
+    END AS reuse_depth_12m,
+
+
+    CASE
+
+        WHEN
+            f.eligible_24m
+            AND COALESCE(
+                ds.n_descendants_24m,
+                0
+            ) > 0
+
+        THEN SAFE_DIVIDE(
+            COALESCE(
+                ru.reuse_events_24m_all,
+                0
+            ),
+            f.reference_count
+        )
+
+        ELSE NULL
+
+    END AS reuse_depth_24m,
+
+
+    CASE
+
+        WHEN
+            f.eligible_36m
+            AND COALESCE(
+                ds.n_descendants_36m,
+                0
+            ) > 0
+
+        THEN SAFE_DIVIDE(
+            COALESCE(
+                ru.reuse_events_36m_all,
+                0
+            ),
+            f.reference_count
+        )
+
+        ELSE NULL
+
+    END AS reuse_depth_36m
+
+FROM `redo.m4_focal` AS f
+
+
+LEFT JOIN `redo.m4_focal_reference_summary` AS rs
+
+    ON f.openalex_id =
+       rs.focal_openalex_id
+
+
+LEFT JOIN `redo.m4_focal_descendant_summary` AS ds
+
+    ON f.openalex_id =
+       ds.focal_openalex_id
+
+
+LEFT JOIN reuse AS ru
+
+    ON f.openalex_id =
+       ru.focal_openalex_id;
+
+
+
+/*==============================================================================
+SECTION 12
+FINAL M4 QC
+==============================================================================*/
+
+SELECT
+
+    COUNT(*) AS n_focal_papers,
+
+    COUNTIF(
+        retention_eligible_3plus_refs
+    ) AS n_3plus_reference_focal_papers,
+
+
+    /*--------------------------------------------------------------------------
+      REFERENCE COVERAGE
+    --------------------------------------------------------------------------*/
+
+    AVG(
+        share_references_resolved
+    ) AS mean_share_references_resolved,
+
+    AVG(
+        share_references_temporally_valid
+    ) AS mean_share_references_temporally_valid,
+
+
+    /*--------------------------------------------------------------------------
+      FIXED-WINDOW ELIGIBILITY
+    --------------------------------------------------------------------------*/
+
+    COUNTIF(
+        eligible_12m
+        AND retention_eligible_3plus_refs
+    ) AS n_primary_12m,
+
+    COUNTIF(
+        eligible_24m
+        AND retention_eligible_3plus_refs
+    ) AS n_primary_24m,
+
+    COUNTIF(
+        eligible_36m
+        AND retention_eligible_3plus_refs
+    ) AS n_primary_36m,
+
+
+    /*--------------------------------------------------------------------------
+      2025
+    --------------------------------------------------------------------------*/
+
+    COUNTIF(
+        accepted_year = 2025
+    ) AS n_2025_focal_papers,
+
+    COUNTIF(
+        accepted_year = 2025
+        AND retention_eligible_3plus_refs
+    ) AS n_2025_3plus_refs,
+
+    COUNTIF(
+        accepted_year = 2025
+        AND eligible_12m
+        AND retention_eligible_3plus_refs
+    ) AS n_2025_complete_12m,
+
+    COUNTIF(
+        accepted_year = 2025
+        AND NOT eligible_12m
+        AND retention_eligible_3plus_refs
+    ) AS n_2025_partial_12m,
+
+    COUNTIF(
+        accepted_year = 2025
+        AND openalex_work_unmatched
+    ) AS n_2025_openalex_unmatched,
+
+
+    /*--------------------------------------------------------------------------
+      CITATION OPPORTUNITY
+    --------------------------------------------------------------------------*/
+
+    COUNTIF(
+        eligible_12m
+        AND retention_eligible_3plus_refs
+        AND cited_within_12m
+    ) AS n_cited_12m,
+
+    COUNTIF(
+        eligible_24m
+        AND retention_eligible_3plus_refs
+        AND cited_within_24m
+    ) AS n_cited_24m,
+
+    COUNTIF(
+        eligible_36m
+        AND retention_eligible_3plus_refs
+        AND cited_within_36m
+    ) AS n_cited_36m,
+
+
+    /*--------------------------------------------------------------------------
+      PRIMARY RETENTION
+    --------------------------------------------------------------------------*/
+
+    AVG(
+        IF(
+            eligible_12m
+            AND retention_eligible_3plus_refs
+            AND cited_within_12m,
+            retention_breadth_12m_all_conditional,
+            NULL
+        )
+    ) AS mean_retention_12m_conditional,
+
+    AVG(
+        IF(
+            eligible_24m
+            AND retention_eligible_3plus_refs
+            AND cited_within_24m,
+            retention_breadth_24m_all_conditional,
+            NULL
+        )
+    ) AS mean_retention_24m_conditional,
+
+    AVG(
+        IF(
+            eligible_36m
+            AND retention_eligible_3plus_refs
+            AND cited_within_36m,
+            retention_breadth_36m_all_conditional,
+            NULL
+        )
+    ) AS mean_retention_36m_conditional,
+
+
+    /*--------------------------------------------------------------------------
+      EXTERNAL RETENTION
+    --------------------------------------------------------------------------*/
+
+    AVG(
+        IF(
+            eligible_12m
+            AND retention_eligible_3plus_refs
+            AND externally_cited_within_12m,
+            retention_breadth_12m_external_conditional,
+            NULL
+        )
+    ) AS mean_external_retention_12m,
+
+    AVG(
+        IF(
+            eligible_24m
+            AND retention_eligible_3plus_refs
+            AND externally_cited_within_24m,
+            retention_breadth_24m_external_conditional,
+            NULL
+        )
+    ) AS mean_external_retention_24m,
+
+    AVG(
+        IF(
+            eligible_36m
+            AND retention_eligible_3plus_refs
+            AND externally_cited_within_36m,
+            retention_breadth_36m_external_conditional,
+            NULL
+        )
+    ) AS mean_external_retention_36m,
+
+
+    /*--------------------------------------------------------------------------
+      VALID-REFERENCE ROBUSTNESS
+    --------------------------------------------------------------------------*/
+
+    AVG(
+        retention_breadth_12m_valid_refs_conditional
+    ) AS mean_retention_12m_valid_refs,
+
+    AVG(
+        retention_breadth_24m_valid_refs_conditional
+    ) AS mean_retention_24m_valid_refs,
+
+    AVG(
+        retention_breadth_36m_valid_refs_conditional
+    ) AS mean_retention_36m_valid_refs,
+
+
+    /*--------------------------------------------------------------------------
+      2025 OBSERVED RETENTION
+    --------------------------------------------------------------------------*/
+
+    AVG(
+        IF(
+            accepted_year = 2025
+            AND retention_eligible_3plus_refs,
+            observed_retention_breadth_to_snapshot,
+            NULL
+        )
+    ) AS mean_2025_observed_retention_to_snapshot
+
+FROM `redo.m4_retention_summary`;
+
+
+
+/*==============================================================================
+SECTION 13
+YEARLY M4 QC
+==============================================================================*/
+
+SELECT
+
+    accepted_year,
+
+    COUNT(*) AS n_focal_papers,
+
+    COUNTIF(
+        retention_eligible_3plus_refs
+    ) AS n_3plus_reference_papers,
+
+
+    /*--------------------------------------------------------------------------
+      OPENALEX COVERAGE
+    --------------------------------------------------------------------------*/
+
+    COUNTIF(
+        openalex_work_unmatched
+    ) AS openalex_unmatched,
+
+    SAFE_DIVIDE(
+        COUNTIF(
+            openalex_work_unmatched
+        ),
+        COUNT(*)
+    ) AS share_openalex_unmatched,
+
+
+    /*--------------------------------------------------------------------------
+      REFERENCE COVERAGE
+    --------------------------------------------------------------------------*/
+
+    AVG(
+        share_references_resolved
+    ) AS mean_share_refs_resolved,
+
+    AVG(
+        share_references_temporally_valid
+    ) AS mean_share_refs_temporally_valid,
+
+
+    /*--------------------------------------------------------------------------
+      WINDOW ELIGIBILITY
+    --------------------------------------------------------------------------*/
+
+    COUNTIF(
+        eligible_12m
+        AND retention_eligible_3plus_refs
+    ) AS eligible_12m,
+
+    COUNTIF(
+        eligible_24m
+        AND retention_eligible_3plus_refs
+    ) AS eligible_24m,
+
+    COUNTIF(
+        eligible_36m
+        AND retention_eligible_3plus_refs
+    ) AS eligible_36m,
+
+
+    /*--------------------------------------------------------------------------
+      COMPLETE-WINDOW CITATIONS
+    --------------------------------------------------------------------------*/
+
+    COUNTIF(
+        eligible_12m
+        AND retention_eligible_3plus_refs
+        AND cited_within_12m
+    ) AS cited_12m,
+
+    COUNTIF(
+        eligible_24m
+        AND retention_eligible_3plus_refs
+        AND cited_within_24m
+    ) AS cited_24m,
+
+    COUNTIF(
+        eligible_36m
+        AND retention_eligible_3plus_refs
+        AND cited_within_36m
+    ) AS cited_36m,
+
+
+    /*--------------------------------------------------------------------------
+      OBSERVED CITATION THROUGH SNAPSHOT
+    --------------------------------------------------------------------------*/
+
+    COUNTIF(
+        retention_eligible_3plus_refs
+        AND n_observed_descendants_to_snapshot > 0
+    ) AS observed_cited_to_snapshot,
+
+
+    /*--------------------------------------------------------------------------
+      RETENTION
+    --------------------------------------------------------------------------*/
+
+    AVG(
+        IF(
+            eligible_12m
+            AND retention_eligible_3plus_refs,
+            retention_breadth_12m_all_unconditional,
+            NULL
+        )
+    ) AS mean_retention_12m_unconditional,
+
+    AVG(
+        IF(
+            eligible_12m
+            AND retention_eligible_3plus_refs
+            AND cited_within_12m,
+            retention_breadth_12m_all_conditional,
+            NULL
+        )
+    ) AS mean_retention_12m_conditional,
+
+    AVG(
+        IF(
+            eligible_12m
+            AND retention_eligible_3plus_refs
+            AND externally_cited_within_12m,
+            retention_breadth_12m_external_conditional,
+            NULL
+        )
+    ) AS mean_external_retention_12m,
+
+
+    /*--------------------------------------------------------------------------
+      OBSERVED RETENTION
+    --------------------------------------------------------------------------*/
+
+    AVG(
+        IF(
+            retention_eligible_3plus_refs,
+            observed_retention_breadth_to_snapshot,
+            NULL
+        )
+    ) AS mean_observed_retention_to_snapshot
+
+
+FROM `redo.m4_retention_summary`
+
+GROUP BY
+    accepted_year
+
+ORDER BY
+    accepted_year;
